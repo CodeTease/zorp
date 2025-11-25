@@ -1,6 +1,6 @@
 [package]
 name = "zorp"
-version = "0.1.0"
+version = "0.1.0" 
 edition = "2024"
 authors = ["CodeTease"]
 description = "High-performance ephemeral CI/CD dispatcher."
@@ -9,6 +9,9 @@ description = "High-performance ephemeral CI/CD dispatcher."
 # Async Runtime & Web Server
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
+
+# HTTP Client (New!) - For Webhook Callbacks
+reqwest = { version = "0.12", features = ["json"] }
 
 # Database (SQLite)
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
