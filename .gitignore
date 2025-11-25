@@ -22,3 +22,5 @@ target
 
 # Internal
 zorp.*
+.env
+venv

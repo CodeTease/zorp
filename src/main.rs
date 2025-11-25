@@ -1,10 +1,11 @@
 // Zorp v0.1.0
-// The Smart Ephemeral CI/CD Dispatcher (Log Collector Edition).
+// The Smart Ephemeral CI/CD Dispatcher.
 // Copyright (c) 2025 CodeTease.
 
 use axum::{
-    extract::{Path, State, Json},
-    http::StatusCode,
+    async_trait,
+    extract::{FromRequestParts, Path, State, Json, Query},
+    http::{header, request::Parts, StatusCode},
     routing::{get, post},
     Router,
 };
@@ -19,16 +20,41 @@ use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{migrate::MigrateDatabase, sqlite::SqlitePoolOptions, Sqlite, SqlitePool, Row};
 use std::collections::HashMap;
+use std::env;
+use dotenvy::dotenv;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
+use tracing::info;
 use uuid::Uuid;
 
 // --- CONFIGURATION ---
 const PORT: u16 = 3000;
 const MAX_CONCURRENT_JOBS: usize = 20;
 const DB_URL: &str = "sqlite://zorp.db";
+
+// --- AUTHENTICATION ---
+struct Auth;
+
+#[async_trait]
+impl FromRequestParts<Arc<AppState>> for Auth
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+        if let Some(auth_header) = parts.headers.get(header::AUTHORIZATION) {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                    if token == state.secret_key {
+                        return Ok(Self);
+                    }
+                }
+            }
+        }
+        Err((StatusCode::UNAUTHORIZED, "Unauthorized"))
+    }
+}
 
 // --- DATA STRUCTURES ---
 
@@ -71,13 +97,14 @@ struct AppState {
     db: SqlitePool,
     http_client: reqwest::Client,
     limiter: Arc<Semaphore>,
+    secret_key: String,
 }
 
 // --- DATABASE SETUP ---
 
 async fn init_db() -> Result<SqlitePool, Box<dyn std::error::Error>> {
     if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
-        tracing::info!("Creating database: {}", DB_URL);
+        info!("Creating database: {}", DB_URL);
         Sqlite::create_database(DB_URL).await?;
     }
 
@@ -93,6 +120,7 @@ async fn init_db() -> Result<SqlitePool, Box<dyn std::error::Error>> {
             exit_code INTEGER,
             image TEXT NOT NULL,
             commands TEXT NOT NULL,
+            logs TEXT,
             callback_url TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
@@ -106,7 +134,7 @@ async fn init_db() -> Result<SqlitePool, Box<dyn std::error::Error>> {
 // --- ENGINE LOGIC ---
 
 impl AppState {
-    fn new(pool: SqlitePool) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(pool: SqlitePool, secret_key: String) -> Result<Self, Box<dyn std::error::Error>> {
         let docker = Docker::connect_with_local_defaults()?;
         let http_client = reqwest::Client::new();
         
@@ -115,6 +143,7 @@ impl AppState {
             db: pool,
             http_client,
             limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS)),
+            secret_key,
         })
     }
 
@@ -134,11 +163,11 @@ impl AppState {
                 .bind(&job.id)
                 .execute(&db).await;
 
-            tracing::info!("[{}] Status: RUNNING", job.id);
+            info!("[{}] Status: RUNNING", job.id);
 
             let mut final_status = "FINISHED";
             let mut final_exit_code = 0;
-            let mut captured_logs = String::new(); // [NEW] Buffer to hold logs
+            let captured_logs: String;
 
             // 1. Env & Limits Setup
             let env_vars: Option<Vec<String>> = job.env.map(|map| {
@@ -155,7 +184,7 @@ impl AppState {
 
             // 2. Pull Image
             if let Err(e) = ensure_image(&docker, &job.image).await {
-                tracing::error!("[{}] Image error: {}", job.id, e);
+                tracing::error!("[{}] Image error: {}. Stdout: {}", job.id, e, e.to_string());
                 final_status = "FAILED";
                 final_exit_code = -1;
                 captured_logs = format!("System Error: {}", e);
@@ -183,11 +212,8 @@ impl AppState {
                         // 4. Start
                         if docker.start_container(&container_name, None::<StartContainerOptions<String>>).await.is_ok() {
                             
-                            // [NEW] Capture Logs asynchronously
-                            // We collect logs BEFORE waiting for exit to ensure we don't miss anything if it's fast
                             captured_logs = collect_logs(&docker, &container_name).await;
 
-                            // Wait for exit
                             let wait_res = docker.wait_container(&container_name, None::<WaitContainerOptions<String>>)
                                 .try_collect::<Vec<_>>()
                                 .await;
@@ -217,22 +243,22 @@ impl AppState {
             let duration = start_time.elapsed().as_secs_f64();
 
             // UPDATE DB
-            let _ = sqlx::query("UPDATE jobs SET status = ?, exit_code = ? WHERE id = ?")
+            let _ = sqlx::query("UPDATE jobs SET status = ?, exit_code = ?, logs = ? WHERE id = ?")
                 .bind(final_status)
                 .bind(final_exit_code)
+                .bind(&captured_logs)
                 .bind(&job.id)
                 .execute(&db).await;
 
-            tracing::info!("[{}] Status: {} (Exit: {}). Time: {:.2}s", job.id, final_status, final_exit_code, duration);
+            info!("[{}] Status: {} (Exit: {}). Time: {:.2}s", job.id, final_status, final_exit_code, duration);
 
-            // 5. WEBHOOK CALLBACK (With LOGS!)
+            // 5. WEBHOOK CALLBACK
             if let Some(url) = job.callback_url {
                 let payload = serde_json::json!({
                     "job_id": job.id,
                     "status": final_status,
                     "exit_code": final_exit_code,
                     "duration_seconds": duration,
-                    "logs": captured_logs // [NEW] The proof!
                 });
 
                 let _ = http_client.post(&url)
@@ -254,7 +280,6 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<(), bollard::error
     Ok(())
 }
 
-// [NEW] Log Collector Helper
 async fn collect_logs(docker: &Docker, name: &str) -> String {
     let options = Some(LogsOptions::<String> {
         stdout: true, stderr: true, follow: true, tail: "all".to_string(), ..Default::default()
@@ -269,9 +294,6 @@ async fn collect_logs(docker: &Docker, name: &str) -> String {
             LogOutput::StdErr { message } => String::from_utf8_lossy(&message).to_string(),
             _ => String::new(),
         };
-        // In ra console server để debug
-        // print!("{}", msg); 
-        // Và lưu vào buffer
         buffer.push_str(&msg);
     }
     buffer
@@ -280,11 +302,12 @@ async fn collect_logs(docker: &Docker, name: &str) -> String {
 // --- HTTP HANDLERS ---
 
 async fn health_check() -> &'static str {
-    "Zorp v0.1.0 (Log Collector) is running."
+    "Zorp v0.1.0 is running."
 }
 
 async fn handle_dispatch(
     State(state): State<Arc<AppState>>,
+    _: Auth,
     Json(payload): Json<JobRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let job_id = Uuid::new_v4().to_string();
@@ -334,8 +357,57 @@ async fn handle_get_job(
     .fetch_optional(&state.db).await;
 
     match row {
-        Ok(Some(job)) => (StatusCode::OK, Json(serde_json::to_value(job).unwrap())),
+        Ok(Some(job)) => (StatusCode::OK, Json(serde_json::to_value(job).unwrap_or_default())),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Job not found"}))),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Database error"})))
+    }
+}
+
+async fn handle_get_job_logs(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let result = sqlx::query("SELECT logs FROM jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_optional(&state.db)
+        .await;
+
+    match result {
+        Ok(Some(row)) => {
+            let logs: Option<String> = row.get("logs");
+            (StatusCode::OK, Json(serde_json::json!({ "logs": logs.unwrap_or_default() })))
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Job not found" }))),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Database error" }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct JobsQuery {
+    limit: Option<i64>,
+    status: Option<String>,
+}
+
+async fn handle_list_jobs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<JobsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT id, status, exit_code, image, created_at FROM jobs");
+
+    if let Some(status) = query.status {
+        q_builder.push(" WHERE status = ");
+        q_builder.push_bind(status);
+    }
+
+    q_builder.push(" ORDER BY created_at DESC LIMIT ");
+    q_builder.push_bind(query.limit.unwrap_or(20));
+
+    let result = q_builder.build_query_as::<JobStatus>()
+        .fetch_all(&state.db)
+        .await;
+
+    match result {
+        Ok(jobs) => (StatusCode::OK, Json(serde_json::to_value(jobs).unwrap_or_default())),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Database error"})))
     }
 }
@@ -344,16 +416,26 @@ async fn handle_get_job(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
     tracing_subscriber::fmt::init();
-    tracing::info!(":: Zorp v0.1.0 (Log Collector) ::");
+
+    let secret_key = env::var("ZORP_SECRET_KEY")
+        .map_err(|_| {
+            tracing::error!("ZORP_SECRET_KEY environment variable not set.");
+            std::io::Error::new(std::io::ErrorKind::Other, "Missing ZORP_SECRET_KEY")
+        })?;
+
+    tracing::info!(":: Zorp v0.1.0 ::");
     
     let db_pool = init_db().await?;
-    let state = Arc::new(AppState::new(db_pool)?);
+    let state = Arc::new(AppState::new(db_pool, secret_key)?);
 
     let app = Router::new()
         .route("/", get(health_check))
         .route("/dispatch", post(handle_dispatch))
         .route("/job/:id", get(handle_get_job))
+        .route("/job/:id/logs", get(handle_get_job_logs))
+        .route("/jobs", get(handle_list_jobs))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], PORT));
