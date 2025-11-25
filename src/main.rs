@@ -1,5 +1,5 @@
-// Zorp v0.2.0
-// The Smart Ephemeral CI/CD Dispatcher.
+// Zorp v0.1.0
+// The Smart Ephemeral CI/CD Dispatcher (Log Collector Edition).
 // Copyright (c) 2025 CodeTease.
 
 use axum::{
@@ -42,9 +42,9 @@ struct JobLimits {
 struct JobRequest {
     image: String,
     commands: Vec<String>,
-    env: Option<HashMap<String, String>>, // New: Environment Variables
-    limits: Option<JobLimits>,            // New: Resource Limits
-    callback_url: Option<String>,         // New: Webhook URL
+    env: Option<HashMap<String, String>>,
+    limits: Option<JobLimits>,
+    callback_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -62,14 +62,14 @@ struct JobContext {
     image: String,
     commands: Vec<String>,
     env: Option<HashMap<String, String>>,
-    limits: Option<Arc<JobLimits>>, // Use Arc for cheap cloning if needed
+    limits: Option<Arc<JobLimits>>,
     callback_url: Option<String>,
 }
 
 struct AppState {
     docker: Docker,
     db: SqlitePool,
-    http_client: reqwest::Client, // New: For outgoing webhooks
+    http_client: reqwest::Client,
     limiter: Arc<Semaphore>,
 }
 
@@ -85,7 +85,6 @@ async fn init_db() -> Result<SqlitePool, Box<dyn std::error::Error>> {
         .max_connections(5)
         .connect(DB_URL).await?;
 
-    // Updated Schema with callback_url
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS jobs (
@@ -139,36 +138,37 @@ impl AppState {
 
             let mut final_status = "FINISHED";
             let mut final_exit_code = 0;
+            let mut captured_logs = String::new(); // [NEW] Buffer to hold logs
 
-            // 1. Prepare Environment Variables
+            // 1. Env & Limits Setup
             let env_vars: Option<Vec<String>> = job.env.map(|map| {
                 map.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
             });
 
-            // 2. Prepare Limits
             let memory = job.limits.as_ref()
                 .and_then(|l| l.memory_mb)
-                .map(|mb| mb * 1024 * 1024); // Convert MB to Bytes
+                .map(|mb| mb * 1024 * 1024);
             
             let cpu_quota = job.limits.as_ref()
                 .and_then(|l| l.cpu_cores)
-                .map(|cores| (cores * 100000.0) as i64); // 1.0 Core = 100000 microseconds
+                .map(|cores| (cores * 100000.0) as i64);
 
-            // 3. Pull Image
+            // 2. Pull Image
             if let Err(e) = ensure_image(&docker, &job.image).await {
                 tracing::error!("[{}] Image error: {}", job.id, e);
                 final_status = "FAILED";
                 final_exit_code = -1;
+                captured_logs = format!("System Error: {}", e);
             } else {
-                // 4. Configure Container
+                // 3. Configure & Create
                 let config = Config {
                     image: Some(job.image.clone()),
                     cmd: Some(job.commands.clone()),
                     env: env_vars,
                     host_config: Some(HostConfig {
                         auto_remove: Some(false),
-                        memory: memory.or(Some(1024 * 1024 * 512)), // Default 512MB
-                        cpu_quota: cpu_quota.or(Some(100000)),      // Default 1 Core
+                        memory: memory.or(Some(1024 * 1024 * 512)), 
+                        cpu_quota: cpu_quota.or(Some(100000)),
                         ..Default::default()
                     }),
                     tty: Some(true),
@@ -180,7 +180,13 @@ impl AppState {
                     config
                 ).await {
                     Ok(_) => {
+                        // 4. Start
                         if docker.start_container(&container_name, None::<StartContainerOptions<String>>).await.is_ok() {
+                            
+                            // [NEW] Capture Logs asynchronously
+                            // We collect logs BEFORE waiting for exit to ensure we don't miss anything if it's fast
+                            captured_logs = collect_logs(&docker, &container_name).await;
+
                             // Wait for exit
                             let wait_res = docker.wait_container(&container_name, None::<WaitContainerOptions<String>>)
                                 .try_collect::<Vec<_>>()
@@ -194,11 +200,13 @@ impl AppState {
                         } else {
                             final_status = "FAILED";
                             final_exit_code = -2;
+                            captured_logs = "Error: Container failed to start.".to_string();
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         final_status = "FAILED";
                         final_exit_code = -3;
+                        captured_logs = format!("Error: Container creation failed: {}", e);
                     }
                 }
 
@@ -208,7 +216,7 @@ impl AppState {
 
             let duration = start_time.elapsed().as_secs_f64();
 
-            // UPDATE STATUS DB
+            // UPDATE DB
             let _ = sqlx::query("UPDATE jobs SET status = ?, exit_code = ? WHERE id = ?")
                 .bind(final_status)
                 .bind(final_exit_code)
@@ -217,17 +225,16 @@ impl AppState {
 
             tracing::info!("[{}] Status: {} (Exit: {}). Time: {:.2}s", job.id, final_status, final_exit_code, duration);
 
-            // 5. WEBHOOK CALLBACK (Fire & Forget)
+            // 5. WEBHOOK CALLBACK (With LOGS!)
             if let Some(url) = job.callback_url {
-                tracing::info!("[{}] Sending webhook to: {}", job.id, url);
                 let payload = serde_json::json!({
                     "job_id": job.id,
                     "status": final_status,
                     "exit_code": final_exit_code,
-                    "duration_seconds": duration
+                    "duration_seconds": duration,
+                    "logs": captured_logs // [NEW] The proof!
                 });
 
-                // Send without awaiting response indefinitely (timeout 5s)
                 let _ = http_client.post(&url)
                     .json(&payload)
                     .timeout(std::time::Duration::from_secs(5))
@@ -247,10 +254,33 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<(), bollard::error
     Ok(())
 }
 
+// [NEW] Log Collector Helper
+async fn collect_logs(docker: &Docker, name: &str) -> String {
+    let options = Some(LogsOptions::<String> {
+        stdout: true, stderr: true, follow: true, tail: "all".to_string(), ..Default::default()
+    });
+
+    let mut stream = docker.logs(name, options);
+    let mut buffer = String::new();
+
+    while let Ok(Some(log)) = stream.try_next().await {
+        let msg = match log {
+            LogOutput::StdOut { message } | LogOutput::Console { message } => String::from_utf8_lossy(&message).to_string(),
+            LogOutput::StdErr { message } => String::from_utf8_lossy(&message).to_string(),
+            _ => String::new(),
+        };
+        // In ra console server để debug
+        // print!("{}", msg); 
+        // Và lưu vào buffer
+        buffer.push_str(&msg);
+    }
+    buffer
+}
+
 // --- HTTP HANDLERS ---
 
 async fn health_check() -> &'static str {
-    "Zorp v0.2.0 is running."
+    "Zorp v0.1.0 (Log Collector) is running."
 }
 
 async fn handle_dispatch(
@@ -259,8 +289,6 @@ async fn handle_dispatch(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let job_id = Uuid::new_v4().to_string();
     
-    // Save to DB
-    // Note: We don't store env vars in DB for simple security in this version
     let insert_result = sqlx::query(
         "INSERT INTO jobs (id, status, image, commands, callback_url) VALUES (?, 'QUEUED', ?, ?, ?)"
     )
@@ -317,7 +345,7 @@ async fn handle_get_job(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    tracing::info!(":: Zorp v0.2.0 (Smart Agent) ::");
+    tracing::info!(":: Zorp v0.1.0 (Log Collector) ::");
     
     let db_pool = init_db().await?;
     let state = Arc::new(AppState::new(db_pool)?);
