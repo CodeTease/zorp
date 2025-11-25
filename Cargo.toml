@@ -1,6 +1,6 @@
 [package]
 name = "zorp"
-version = "0.1.0" 
+version = "0.1.0"
 edition = "2024"
 authors = ["CodeTease"]
 description = "High-performance ephemeral CI/CD dispatcher."
@@ -11,7 +11,6 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 
 # Database (SQLite)
-# Dùng feature 'runtime-tokio' để tương thích với hệ thống
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
 
 # Docker Interface

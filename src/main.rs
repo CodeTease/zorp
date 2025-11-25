@@ -27,7 +27,6 @@ use uuid::Uuid;
 // --- CONFIGURATION ---
 const PORT: u16 = 3000;
 const MAX_CONCURRENT_JOBS: usize = 20; 
-const DOCKER_SOCKET: &str = "unix:///var/run/docker.sock";
 const DB_URL: &str = "sqlite://zorp.db";
 
 // --- DATA STRUCTURES ---
@@ -44,7 +43,7 @@ struct JobStatus {
     status: String,      // QUEUED, RUNNING, FINISHED, FAILED
     exit_code: Option<i32>,
     image: String,
-    created_at: String,  // Simple ISO string for now
+    created_at: String, 
 }
 
 struct AppState {
@@ -56,6 +55,7 @@ struct AppState {
 // --- DATABASE SETUP ---
 
 async fn init_db() -> Result<SqlitePool, Box<dyn std::error::Error>> {
+    // Trên Windows, file zorp.db sẽ được tạo tại thư mục chạy lệnh cargo run
     if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
         tracing::info!("Creating database: {}", DB_URL);
         Sqlite::create_database(DB_URL).await?;
@@ -65,7 +65,6 @@ async fn init_db() -> Result<SqlitePool, Box<dyn std::error::Error>> {
         .max_connections(5)
         .connect(DB_URL).await?;
 
-    // Create table if not exists (No migration files needed for single binary)
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS jobs (
@@ -87,7 +86,11 @@ async fn init_db() -> Result<SqlitePool, Box<dyn std::error::Error>> {
 
 impl AppState {
     fn new(pool: SqlitePool) -> Result<Self, Box<dyn std::error::Error>> {
-        let docker = Docker::connect_with_socket(DOCKER_SOCKET, 120, bollard::API_DEFAULT_VERSION)?;
+        // [UPDATE] Sử dụng connect_with_local_defaults để tự động detect:
+        // - Unix Socket trên Linux/Mac
+        // - Named Pipe trên Windows
+        let docker = Docker::connect_with_local_defaults()?;
+        
         Ok(Self {
             docker,
             db: pool,
@@ -100,8 +103,6 @@ impl AppState {
         let docker = self.docker.clone();
         let db = self.db.clone();
         
-        let commands_str = serde_json::to_string(&commands).unwrap_or_default();
-
         tokio::spawn(async move {
             let _permit = permit; 
             let start_time = Instant::now();
@@ -143,8 +144,6 @@ impl AppState {
                 ).await {
                     Ok(_) => {
                         if docker.start_container(&container_name, None::<StartContainerOptions<String>>).await.is_ok() {
-                            // Stream logs (omitted for brevity in this update, focusing on DB)
-                            // Wait for exit
                             let wait_res = docker.wait_container(&container_name, None::<WaitContainerOptions<String>>)
                                 .try_collect::<Vec<_>>()
                                 .await;
@@ -192,7 +191,7 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<(), bollard::error
 // --- HTTP HANDLERS ---
 
 async fn health_check() -> &'static str {
-    "Zorp is running (with Persistence)."
+    "Zorp is running (Windows Compatible)."
 }
 
 async fn handle_dispatch(
@@ -201,7 +200,6 @@ async fn handle_dispatch(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let job_id = Uuid::new_v4().to_string();
     
-    // Save to DB immediately as QUEUED
     let cmd_str = serde_json::to_string(&payload.commands).unwrap();
     let insert_result = sqlx::query(
         "INSERT INTO jobs (id, status, image, commands) VALUES (?, 'QUEUED', ?, ?)"
@@ -213,9 +211,7 @@ async fn handle_dispatch(
 
     match insert_result {
         Ok(_) => {
-            // Trigger async worker
             state.dispatch_job(job_id.clone(), payload.image, payload.commands).await;
-
             (StatusCode::ACCEPTED, Json(serde_json::json!({
                 "status": "queued",
                 "job_id": job_id
@@ -232,7 +228,6 @@ async fn handle_get_job(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Query DB for status
     let row = sqlx::query_as::<_, JobStatus>(
         "SELECT id, status, exit_code, image, created_at FROM jobs WHERE id = ?"
     )
@@ -251,7 +246,7 @@ async fn handle_get_job(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    tracing::info!(":: Zorp (v0.1.0) - Persistence Enabled ::");
+    tracing::info!(":: Zorp (v0.1.0) ::");
     
     // Init Database first
     let db_pool = init_db().await?;
@@ -261,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(health_check))
         .route("/dispatch", post(handle_dispatch))
-        .route("/job/:id", get(handle_get_job)) // New Endpoint
+        .route("/job/:id", get(handle_get_job)) 
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], PORT));
