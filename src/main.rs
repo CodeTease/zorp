@@ -9,6 +9,9 @@ mod models;
 use bollard::Docker;
 use dotenvy::dotenv;
 use std::env;
+
+#[cfg(feature = "s3_logging")]
+use aws_config::{self, BehaviorVersion};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -43,11 +46,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
     
+    // -- S3 CLIENT SETUP (CONDITIONAL) --
+    let mut s3_client = None;
+    let mut s3_bucket = None;
+
+    if cfg!(feature = "s3_logging") {
+        if let Ok(val) = env::var("ENABLE_S3_LOGGING") {
+            if val.parse().unwrap_or(false) {
+                info!("S3 logging is enabled. Configuring S3 client...");
+                
+                let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+                let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
+
+                if let Ok(endpoint) = env::var("S3_ENDPOINT_URL") {
+                    s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+                }
+
+                if let Ok(force_path) = env::var("S3_FORCE_PATH_STYLE") {
+                     s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
+                }
+                
+                s3_client = Some(aws_sdk_s3::Client::from_conf(s3_config_builder.build()));
+                s3_bucket = env::var("S3_BUCKET_NAME").ok();
+
+                if s3_bucket.is_none() {
+                    error!("S3_BUCKET_NAME is not set. S3 logging will be disabled.");
+                    s3_client = None;
+                } else {
+                    info!("S3 client configured for bucket: {:?}", s3_bucket.as_ref().unwrap());
+                }
+            } else {
+                info!("S3 logging is disabled via configuration. Using database for logs.");
+            }
+        } else {
+            info!("S3 logging is disabled by default. Using database for logs.");
+        }
+    }
+    
     let dispatcher = Arc::new(engine::Dispatcher::new(
         docker.clone(),
         db_pool.clone(),
         http_client,
-        MAX_CONCURRENT_JOBS
+        MAX_CONCURRENT_JOBS,
+        #[cfg(feature = "s3_logging")]
+        s3_client.clone(),
+        #[cfg(feature = "s3_logging")]
+        s3_bucket.clone(),
     ));
 
     // 5. Setup App State
@@ -55,6 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: db_pool,
         dispatcher,
         secret_key,
+        #[cfg(feature = "s3_logging")]
+        s3_client,
+        #[cfg(feature = "s3_logging")]
+        s3_bucket,
     });
 
     // 6. Start Server

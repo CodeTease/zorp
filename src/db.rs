@@ -1,4 +1,4 @@
-use sqlx::{migrate::MigrateDatabase, sqlite::{SqlitePoolOptions, SqliteConnectOptions}, Sqlite, SqlitePool, ConnectOptions};
+use sqlx::{migrate::MigrateDatabase, sqlite::{SqlitePoolOptions, SqliteConnectOptions}, Sqlite, SqlitePool};
 use std::str::FromStr;
 use tracing::info;
 

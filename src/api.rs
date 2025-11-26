@@ -1,5 +1,6 @@
 use axum::{
     async_trait,
+    body::Body,
     extract::{FromRequestParts, Path, State, Json, Query},
     http::{header, request::Parts, StatusCode},
     routing::{get, post},
@@ -9,15 +10,23 @@ use std::sync::Arc;
 use sqlx::{Row, SqlitePool};
 use serde::{Deserialize};
 use uuid::Uuid;
-use tracing::error;
+use tracing::{error, info};
 use crate::models::{JobRequest, JobContext, JobStatus};
 use crate::engine::Dispatcher;
+
+#[cfg(feature = "s3_logging")]
+use aws_sdk_s3;
 
 // --- SHARED STATE ---
 pub struct AppState {
     pub db: SqlitePool,
     pub dispatcher: Arc<Dispatcher>,
     pub secret_key: String,
+
+    #[cfg(feature = "s3_logging")]
+    pub s3_client: Option<aws_sdk_s3::Client>,
+    #[cfg(feature = "s3_logging")]
+    pub s3_bucket: Option<String>,
 }
 
 // --- AUTH MIDDLEWARE ---
@@ -107,24 +116,50 @@ async fn handle_get_job(
     }
 }
 
+use axum::response::{IntoResponse, Response};
+
 async fn handle_get_job_logs(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     let result = sqlx::query("SELECT logs FROM jobs WHERE id = ?")
-        .bind(job_id)
+        .bind(&job_id)
         .fetch_optional(&state.db)
         .await;
 
     match result {
         Ok(Some(row)) => {
             let logs: Option<String> = row.get("logs");
-            (StatusCode::OK, Json(serde_json::json!({ "logs": logs.unwrap_or_default() })))
+            let log_content = logs.unwrap_or_default();
+            
+            #[cfg(feature = "s3_logging")]
+            if log_content.starts_with("s3://") {
+                if let (Some(s3), Some(bucket)) = (&state.s3_client, &state.s3_bucket) {
+                    let key = log_content.replace(&format!("s3://{}/", bucket), "");
+                    info!("Streaming log for job {} from S3 key {}", job_id, key);
+                    
+                    match s3.get_object().bucket(bucket).key(key).send().await {
+                        Ok(mut output) => {
+                            let mut body = Vec::new();
+                            while let Some(chunk) = output.body.try_next().await.unwrap() {
+                                body.extend_from_slice(&chunk);
+                            }
+                            return Body::from(body).into_response();
+                        },
+                        Err(e) => {
+                            error!("S3 get_object failed for job {}: {}", job_id, e);
+                            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to retrieve logs from S3" }))).into_response();
+                        }
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({ "logs": log_content }))).into_response()
         },
-        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Job not found" }))),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Job not found" }))).into_response(),
         Err(e) => {
             error!("DB error get_logs: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Database error" })))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Database error" }))).into_response()
         }
     }
 }
@@ -171,3 +206,4 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/jobs", get(handle_list_jobs))
         .with_state(state)
 }
+

@@ -14,6 +14,9 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn, error};
 use crate::models::JobContext;
 
+#[cfg(feature = "s3_logging")]
+use aws_sdk_s3;
+
 // --- THE ZOMBIE REAPER ---
 // Scans and cleans up "hanging" containers or inconsistent DB states upon restart.
 pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
@@ -71,15 +74,31 @@ pub struct Dispatcher {
     db: SqlitePool,
     http_client: reqwest::Client,
     limiter: Arc<Semaphore>,
+
+    #[cfg(feature = "s3_logging")]
+    s3_client: Option<aws_sdk_s3::Client>,
+    #[cfg(feature = "s3_logging")]
+    s3_bucket: Option<String>,
 }
 
 impl Dispatcher {
-    pub fn new(docker: Docker, db: SqlitePool, http_client: reqwest::Client, max_concurrent: usize) -> Self {
+    pub fn new(
+        docker: Docker, 
+        db: SqlitePool, 
+        http_client: reqwest::Client, 
+        max_concurrent: usize,
+        #[cfg(feature = "s3_logging")] s3_client: Option<aws_sdk_s3::Client>,
+        #[cfg(feature = "s3_logging")] s3_bucket: Option<String>,
+    ) -> Self {
         Self {
             docker,
             db,
             http_client,
             limiter: Arc::new(Semaphore::new(max_concurrent)),
+            #[cfg(feature = "s3_logging")]
+            s3_client,
+            #[cfg(feature = "s3_logging")]
+            s3_bucket,
         }
     }
 
@@ -88,6 +107,11 @@ impl Dispatcher {
         let docker = self.docker.clone();
         let db = self.db.clone();
         let http_client = self.http_client.clone();
+        
+        #[cfg(feature = "s3_logging")]
+        let s3_client = self.s3_client.clone();
+        #[cfg(feature = "s3_logging")]
+        let s3_bucket = self.s3_bucket.clone();
         
         tokio::spawn(async move {
             let _permit = permit; 
@@ -191,10 +215,32 @@ impl Dispatcher {
 
             let duration = start_time.elapsed().as_secs_f64();
 
+            // --- LOGS PERSISTENCE ---
+            let mut final_log_ref = captured_logs.clone();
+
+            #[cfg(feature = "s3_logging")]
+            if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
+                let key = format!("logs/{}.txt", job.id);
+                let byte_stream = aws_sdk_s3::primitives::ByteStream::from(captured_logs.clone().into_bytes());
+                
+                info!("[{}] Uploading logs to S3 bucket '{}' with key '{}'", job.id, bucket, key);
+
+                match s3.put_object().bucket(bucket).key(&key).body(byte_stream).send().await {
+                    Ok(_) => {
+                        final_log_ref = format!("s3://{}/{}", bucket, key);
+                        info!("[{}] S3 upload successful.", job.id);
+                    }
+                    Err(e) => {
+                        error!("[{}] S3 upload failed: {}. Falling back to database.", job.id, e);
+                        // final_log_ref is already set to captured_logs
+                    }
+                }
+            }
+            
             if let Err(e) = sqlx::query("UPDATE jobs SET status = ?, exit_code = ?, logs = ? WHERE id = ?")
                 .bind(final_status)
                 .bind(final_exit_code)
-                .bind(&captured_logs)
+                .bind(&final_log_ref)
                 .bind(&job.id)
                 .execute(&db).await 
             {
