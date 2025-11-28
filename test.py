@@ -26,7 +26,7 @@ HOST_IP = "127.0.0.1"
 WEBHOOK_URL = f"http://{HOST_IP}:{WEBHOOK_PORT}"
 
 # Tăng áp lực lên một chút
-NUM_CONCURRENT_JOBS = 10 
+NUM_CONCURRENT_JOBS = 60
 # Giới hạn thời gian chờ tối đa cho toàn bộ test
 MAX_WAIT_TIME = 30 
 
@@ -50,31 +50,44 @@ def generate_scenario(index):
     scenarios = [
         {
             "type": "NORMAL",
-            "cmd": f"echo 'Job {index} normal' && sleep 1",
+            "image": "busybox:latest",
+            "commands": ["sh", "-c", f"echo 'Job {index} normal' && sleep 1"],
             "expect_status": "FINISHED",
             "expect_exit": 0,
-            "weight": 50 # 50% cơ hội
+            "weight": 40
         },
         {
             "type": "FAST",
-            "cmd": f"echo 'Job {index} flash!'", 
+            "image": "busybox:latest",
+            "commands": ["sh", "-c", f"echo 'Job {index} flash!'"],
             "expect_status": "FINISHED",
             "expect_exit": 0,
             "weight": 20
         },
         {
             "type": "FAIL",
-            "cmd": f"echo 'Job {index} dying...' && exit 1",
+            "image": "busybox:latest",
+            "commands": ["sh", "-c", f"echo 'Job {index} dying...' && exit 1"],
             "expect_status": "FINISHED", # Zorp vẫn finish job, nhưng exit code khác
             "expect_exit": 1,
             "weight": 20
         },
         {
             "type": "HEAVY", # Test limits params
-            "cmd": f"echo 'Checking limits...' && sleep 2",
+            "image": "busybox:latest",
+            "commands": ["sh", "-c", f"echo 'Checking limits...' && sleep 2"],
             "limits": {"memory_mb": 128, "cpu_cores": 0.5},
             "expect_status": "FINISHED",
             "expect_exit": 0,
+            "weight": 10
+        },
+        {
+            "type": "OOM", # Test Out-of-Memory
+            "image": "python:3.9-alpine",
+            "commands": ["python", "-c", "print('Allocating 20MB...'); a = bytearray(20 * 1024 * 1024); import time; time.sleep(10)"],
+            "limits": {"memory_mb": 10}, # Allow only 10MB
+            "expect_status": "FINISHED", # OOM kill should be a finished job
+            "expect_exit": 137, # Standard exit code for OOM kill
             "weight": 10
         }
     ]
@@ -89,6 +102,9 @@ class ChaosWebhookHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            # Simulate network latency
+            time.sleep(random.uniform(0.5, 5.0))
+            
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
@@ -139,8 +155,8 @@ def dispatch_worker(i):
     scenario = generate_scenario(i)
     
     payload = {
-        "image": "busybox:latest",
-        "commands": ["sh", "-c", scenario["cmd"]],
+        "image": scenario["image"],
+        "commands": scenario["commands"],
         "callback_url": WEBHOOK_URL
     }
     
@@ -178,6 +194,9 @@ def main():
     print(f"👂 Webhook ready at {WEBHOOK_URL}")
     time.sleep(1)
 
+    print("🚀 Giving Zorp a moment to warm up...")
+    time.sleep(5)
+    
     # Dispatch Threads
     threads = []
     for i in range(1, NUM_CONCURRENT_JOBS + 1):

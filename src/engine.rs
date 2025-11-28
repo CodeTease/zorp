@@ -20,7 +20,7 @@ use aws_sdk_s3;
 // --- THE ZOMBIE REAPER ---
 // Scans and cleans up "hanging" containers or inconsistent DB states upon restart.
 pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
-    info!("💀 Zombie Reaper is scanning for lost souls...");
+    info!("逐 Zombie Reaper is scanning for lost souls...");
 
     // 1. Fetch RUNNING jobs from DB
     let running_jobs = sqlx::query_as::<_, (String,)>("SELECT id FROM jobs WHERE status = 'RUNNING'")
@@ -30,13 +30,13 @@ pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
     match running_jobs {
         Ok(jobs) => {
             if jobs.is_empty() {
-                info!("💀 Reaper: No zombies found. Clean start.");
+                info!("逐 Reaper: No zombies found. Clean start.");
                 return;
             }
 
             for (job_id,) in jobs {
                 let container_name = format!("zorp-{}", job_id);
-                info!("💀 Reaper: Checking potential zombie: {}", container_name);
+                info!("逐 Reaper: Checking potential zombie: {}", container_name);
 
                 // Check if container actually exists in Docker
                 match docker.inspect_container(&container_name, None).await {
@@ -44,7 +44,7 @@ pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
                         let state = inspect.state.unwrap_or_default();
                         if state.running.unwrap_or(false) {
                             // Still running -> Kill it to reset state
-                            warn!("💀 Reaper: Found active zombie {}. Terminating...", job_id);
+                            warn!("逐 Reaper: Found active zombie {}. Terminating...", job_id);
                             let _ = docker.kill_container::<String>(&container_name, None).await;
                         }
                         // Remove container artifacts
@@ -52,7 +52,7 @@ pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
                     }
                     Err(_) => {
                         // Container not found in Docker -> DB state is stale
-                        warn!("💀 Reaper: Ghost job {} found in DB but not in Docker.", job_id);
+                        warn!("逐 Reaper: Ghost job {} found in DB but not in Docker.", job_id);
                     }
                 }
 
@@ -63,7 +63,7 @@ pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
                     .execute(db).await;
             }
         }
-        Err(e) => error!("💀 Reaper failed to query DB: {}", e),
+        Err(e) => error!("逐 Reaper failed to query DB: {}", e),
     }
 }
 
@@ -216,23 +216,27 @@ impl Dispatcher {
             let duration = start_time.elapsed().as_secs_f64();
 
             // --- LOGS PERSISTENCE ---
-            let mut final_log_ref = captured_logs.clone();
+            let final_log_ref = captured_logs.clone();
 
             #[cfg(feature = "s3_logging")]
-            if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
-                let key = format!("logs/{}.txt", job.id);
-                let byte_stream = aws_sdk_s3::primitives::ByteStream::from(captured_logs.clone().into_bytes());
-                
-                info!("[{}] Uploading logs to S3 bucket '{}' with key '{}'", job.id, bucket, key);
+            {
+                // Đoạn này chỉ compile khi feature bật
+                // Khi đó s3_client và s3_bucket được capture vào async block
+                if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
+                    let key = format!("logs/{}.txt", job.id);
+                    let byte_stream = aws_sdk_s3::primitives::ByteStream::from(captured_logs.clone().into_bytes());
+                    
+                    info!("[{}] Uploading logs to S3 bucket '{}' with key '{}'", job.id, bucket, key);
 
-                match s3.put_object().bucket(bucket).key(&key).body(byte_stream).send().await {
-                    Ok(_) => {
-                        final_log_ref = format!("s3://{}/{}", bucket, key);
-                        info!("[{}] S3 upload successful.", job.id);
-                    }
-                    Err(e) => {
-                        error!("[{}] S3 upload failed: {}. Falling back to database.", job.id, e);
-                        // final_log_ref is already set to captured_logs
+                    match s3.put_object().bucket(bucket).key(&key).body(byte_stream).send().await {
+                        Ok(_) => {
+                            final_log_ref = format!("s3://{}/{}", bucket, key);
+                            info!("[{}] S3 upload successful.", job.id);
+                        }
+                        Err(e) => {
+                            error!("[{}] S3 upload failed: {}. Falling back to database.", job.id, e);
+                            // final_log_ref is already set to captured_logs
+                        }
                     }
                 }
             }

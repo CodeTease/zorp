@@ -46,11 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
     
-    // -- S3 CLIENT SETUP (CONDITIONAL) --
-    let mut s3_client = None;
-    let mut s3_bucket = None;
+    // -- S3 CLIENT SETUP (CONDITIONAL COMPILE) --
+    // Chỉ biên dịch đoạn này nếu có feature s3_logging
+    #[cfg(feature = "s3_logging")]
+    let (s3_client, s3_bucket) = {
+        let mut client = None;
+        let mut bucket = None;
 
-    if cfg!(feature = "s3_logging") {
         if let Ok(val) = env::var("ENABLE_S3_LOGGING") {
             if val.parse().unwrap_or(false) {
                 info!("S3 logging is enabled. Configuring S3 client...");
@@ -63,17 +65,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Ok(force_path) = env::var("S3_FORCE_PATH_STYLE") {
-                     s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
+                        s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
                 }
                 
-                s3_client = Some(aws_sdk_s3::Client::from_conf(s3_config_builder.build()));
-                s3_bucket = env::var("S3_BUCKET_NAME").ok();
+                client = Some(aws_sdk_s3::Client::from_conf(s3_config_builder.build()));
+                bucket = env::var("S3_BUCKET_NAME").ok();
 
-                if s3_bucket.is_none() {
+                if bucket.is_none() {
                     error!("S3_BUCKET_NAME is not set. S3 logging will be disabled.");
-                    s3_client = None;
+                    client = None;
                 } else {
-                    info!("S3 client configured for bucket: {:?}", s3_bucket.as_ref().unwrap());
+                    info!("S3 client configured for bucket: {:?}", bucket.as_ref().unwrap());
                 }
             } else {
                 info!("S3 logging is disabled via configuration. Using database for logs.");
@@ -81,13 +83,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             info!("S3 logging is disabled by default. Using database for logs.");
         }
-    }
+        (client, bucket)
+    };
     
     let dispatcher = Arc::new(engine::Dispatcher::new(
         docker.clone(),
         db_pool.clone(),
         http_client,
         MAX_CONCURRENT_JOBS,
+        // Chỉ truyền tham số này vào hàm new nếu feature bật
         #[cfg(feature = "s3_logging")]
         s3_client.clone(),
         #[cfg(feature = "s3_logging")]
@@ -99,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: db_pool,
         dispatcher,
         secret_key,
+        // Chỉ khởi tạo field này nếu feature bật
         #[cfg(feature = "s3_logging")]
         s3_client,
         #[cfg(feature = "s3_logging")]

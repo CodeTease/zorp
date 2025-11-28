@@ -1,6 +1,5 @@
 use axum::{
     async_trait,
-    body::Body,
     extract::{FromRequestParts, Path, State, Json, Query},
     http::{header, request::Parts, StatusCode},
     routing::{get, post},
@@ -10,7 +9,7 @@ use std::sync::Arc;
 use sqlx::{Row, SqlitePool};
 use serde::{Deserialize};
 use uuid::Uuid;
-use tracing::{error, info};
+use tracing::{error};
 use crate::models::{JobRequest, JobContext, JobStatus};
 use crate::engine::Dispatcher;
 
@@ -117,6 +116,8 @@ async fn handle_get_job(
 }
 
 use axum::response::{IntoResponse, Response};
+#[allow(unused_imports)] // Để tránh warning khi feature s3 tắt (vì futures_util::TryStreamExt có thể không dùng)
+use futures_util::TryStreamExt; 
 
 async fn handle_get_job_logs(
     State(state): State<Arc<AppState>>,
@@ -132,6 +133,7 @@ async fn handle_get_job_logs(
             let logs: Option<String> = row.get("logs");
             let log_content = logs.unwrap_or_default();
             
+            // Chỉ compile đoạn logic S3 này khi có feature
             #[cfg(feature = "s3_logging")]
             if log_content.starts_with("s3://") {
                 if let (Some(s3), Some(bucket)) = (&state.s3_client, &state.s3_bucket) {
@@ -206,4 +208,3 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/jobs", get(handle_list_jobs))
         .with_state(state)
 }
-
