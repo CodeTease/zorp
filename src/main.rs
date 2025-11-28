@@ -1,4 +1,4 @@
-// Zorp v0.1.0 - The Bulletproof Edition (Redis Enhanced)
+// Zorp v0.1.0 - The Hybrid Edition (Redis Enhanced)
 // Copyright (c) 2025 CodeTease.
 
 mod api;
@@ -23,6 +23,12 @@ const MAX_CONCURRENT_JOBS: usize = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --- CRITICAL FIX FOR RUSTLS 0.23 PANIC ---
+    // We must manually install the crypto provider at the very start of the process.
+    // This tells rustls to use 'ring' as the underlying crypto engine.
+    // We ignore the error in case something else (like a library) installed it first.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     dotenv().ok();
     tracing_subscriber::fmt::init();
 
@@ -32,16 +38,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::io::Error::new(std::io::ErrorKind::Other, "Missing ZORP_SECRET_KEY")
         })?;
 
-    info!(":: Zorp v0.1.0 (Redis Edition) ::");
+    info!(":: Zorp v0.1.0 (Hybrid Edition) ::");
     
-    // 1. Initialize DB
+    // 1. Initialize DB (Auto-detects based on feature)
     let db_pool = db::init_pool().await?;
 
     // 2. Initialize Redis Queue
+    // Now supports "rediss://" schemes for TLS connections automatically!
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let queue = Arc::new(RedisQueue::new(&redis_url));
     
-    // SECURITY UPDATE: Redacted Redis URL to prevent credential leakage in logs
+    if redis_url.starts_with("rediss://") {
+        info!("🔐 Initializing Redis with TLS encryption...");
+    } else {
+        info!("🔌 Initializing Redis via standard connection...");
+    }
+
+    let queue = Arc::new(RedisQueue::new(&redis_url));
     info!("Connected to Redis Queue successfully.");
 
     // 3. Initialize Docker

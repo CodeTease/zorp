@@ -7,22 +7,22 @@ use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::TryStreamExt; 
 use futures_util::StreamExt;    
-use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::{info, warn, error};
 use crate::models::JobContext;
+use crate::db::{DbPool, sql_placeholder};
 
 #[cfg(feature = "s3_logging")]
 use aws_sdk_s3;
 
 // --- THE ZOMBIE REAPER ---
-// Scans and cleans up "hanging" containers or inconsistent DB states upon restart.
-pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
+pub async fn startup_reaper(docker: &Docker, db: &DbPool) {
     info!("逐 Zombie Reaper is scanning for lost souls...");
 
     // 1. Fetch RUNNING jobs from DB
+    // Since there are no parameters, this query string is safe for both SQLite and Postgres
     let running_jobs = sqlx::query_as::<_, (String,)>("SELECT id FROM jobs WHERE status = 'RUNNING'")
         .fetch_all(db)
         .await;
@@ -57,7 +57,13 @@ pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
                 }
 
                 // Update DB to FAILED
-                let _ = sqlx::query("UPDATE jobs SET status = 'FAILED', logs = ? WHERE id = ?")
+                // Dynamic placeholders: UPDATE jobs SET status = 'FAILED', logs = $1 WHERE id = $2
+                let query = format!(
+                    "UPDATE jobs SET status = 'FAILED', logs = {} WHERE id = {}",
+                    sql_placeholder(1), sql_placeholder(2)
+                );
+
+                let _ = sqlx::query(&query)
                     .bind("System Crash: Job terminated by Zombie Reaper during startup.")
                     .bind(&job_id)
                     .execute(db).await;
@@ -71,7 +77,7 @@ pub async fn startup_reaper(docker: &Docker, db: &SqlitePool) {
 
 pub struct Dispatcher {
     docker: Docker,
-    db: SqlitePool,
+    db: DbPool,
     http_client: reqwest::Client,
     limiter: Arc<Semaphore>,
 
@@ -84,7 +90,7 @@ pub struct Dispatcher {
 impl Dispatcher {
     pub fn new(
         docker: Docker, 
-        db: SqlitePool, 
+        db: DbPool, 
         http_client: reqwest::Client, 
         max_concurrent: usize,
         #[cfg(feature = "s3_logging")] s3_client: Option<aws_sdk_s3::Client>,
@@ -118,7 +124,9 @@ impl Dispatcher {
             let start_time = Instant::now();
             let container_name = format!("zorp-{}", job.id);
 
-            let _ = sqlx::query("UPDATE jobs SET status = 'RUNNING' WHERE id = ?")
+            // Dynamic SQL: UPDATE jobs SET status = 'RUNNING' WHERE id = $1
+            let update_running = format!("UPDATE jobs SET status = 'RUNNING' WHERE id = {}", sql_placeholder(1));
+            let _ = sqlx::query(&update_running)
                 .bind(&job.id)
                 .execute(&db).await;
 
@@ -216,12 +224,10 @@ impl Dispatcher {
             let duration = start_time.elapsed().as_secs_f64();
 
             // --- LOGS PERSISTENCE ---
-            let final_log_ref = captured_logs.clone();
+            let mut final_log_ref = captured_logs.clone();
 
             #[cfg(feature = "s3_logging")]
             {
-                // Đoạn này chỉ compile khi feature bật
-                // Khi đó s3_client và s3_bucket được capture vào async block
                 if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
                     let key = format!("logs/{}.txt", job.id);
                     let byte_stream = aws_sdk_s3::primitives::ByteStream::from(captured_logs.clone().into_bytes());
@@ -235,13 +241,18 @@ impl Dispatcher {
                         }
                         Err(e) => {
                             error!("[{}] S3 upload failed: {}. Falling back to database.", job.id, e);
-                            // final_log_ref is already set to captured_logs
                         }
                     }
                 }
             }
             
-            if let Err(e) = sqlx::query("UPDATE jobs SET status = ?, exit_code = ?, logs = ? WHERE id = ?")
+            // Dynamic SQL: UPDATE jobs SET status = $1, exit_code = $2, logs = $3 WHERE id = $4
+            let update_final = format!(
+                "UPDATE jobs SET status = {}, exit_code = {}, logs = {} WHERE id = {}", 
+                sql_placeholder(1), sql_placeholder(2), sql_placeholder(3), sql_placeholder(4)
+            );
+
+            if let Err(e) = sqlx::query(&update_final)
                 .bind(final_status)
                 .bind(final_exit_code)
                 .bind(&final_log_ref)

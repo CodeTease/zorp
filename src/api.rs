@@ -5,21 +5,25 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use axum::response::{IntoResponse, Response}; // Removed Body from here
+use axum::response::{IntoResponse, Response}; 
 use std::sync::Arc;
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 use serde::{Deserialize};
 use uuid::Uuid;
 use tracing::{error, info};
 use crate::models::{JobRequest, JobContext, JobStatus};
 use crate::queue::JobQueue;
+use crate::db::{DbPool, sql_placeholder};
 
 #[cfg(feature = "s3_logging")]
 use aws_sdk_s3;
+#[cfg(feature = "s3_logging")]
+use axum::body::Body;
 
 // --- SHARED STATE ---
+// Uses the DbPool type alias (either SqlitePool or PgPool)
 pub struct AppState {
-    pub db: SqlitePool,
+    pub db: DbPool,
     pub queue: Arc<dyn JobQueue>,
     pub secret_key: String,
 
@@ -52,7 +56,11 @@ impl FromRequestParts<Arc<AppState>> for Auth {
 // --- HANDLERS ---
 
 async fn health_check() -> &'static str {
-    "Zorp v0.1.0 is running (Redis Enabled)."
+    #[cfg(feature = "postgres")]
+    return "Zorp v0.1.0 is running (PostgreSQL + Redis).";
+    
+    #[cfg(feature = "sqlite")]
+    return "Zorp v0.1.0 is running (SQLite + Redis).";
 }
 
 async fn handle_dispatch(
@@ -63,9 +71,16 @@ async fn handle_dispatch(
     let job_id = Uuid::new_v4().to_string();
     
     // 1. Persist to DB first (Status: QUEUED)
-    let insert_result = sqlx::query(
-        "INSERT INTO jobs (id, status, image, commands, callback_url) VALUES (?, 'QUEUED', ?, ?, ?)"
-    )
+    // Dynamic SQL: INSERT INTO jobs (...) VALUES ($1, 'QUEUED', $2, $3, $4)
+    let query = format!(
+        "INSERT INTO jobs (id, status, image, commands, callback_url) VALUES ({}, 'QUEUED', {}, {}, {})",
+        sql_placeholder(1), // id
+        sql_placeholder(2), // image
+        sql_placeholder(3), // commands
+        sql_placeholder(4)  // callback_url
+    );
+
+    let insert_result = sqlx::query(&query)
     .bind(&job_id)
     .bind(&payload.image)
     .bind(serde_json::to_string(&payload.commands).unwrap_or_default())
@@ -95,8 +110,15 @@ async fn handle_dispatch(
                 },
                 Err(e) => {
                     error!("Redis error for job {}: {}", job_id, e);
-                    // Update DB status to FAILED if queue push fails
-                    let _ = sqlx::query("UPDATE jobs SET status = 'FAILED', logs = ? WHERE id = ?")
+                    
+                    // Fallback update if queue fails
+                    // Dynamic SQL: UPDATE jobs SET status = 'FAILED', logs = $1 WHERE id = $2
+                    let update_query = format!(
+                        "UPDATE jobs SET status = 'FAILED', logs = {} WHERE id = {}",
+                        sql_placeholder(1), sql_placeholder(2)
+                    );
+
+                    let _ = sqlx::query(&update_query)
                         .bind(format!("System Error: Queue unavailable - {}", e))
                         .bind(&job_id)
                         .execute(&state.db).await;
@@ -116,9 +138,13 @@ async fn handle_get_job(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let row = sqlx::query_as::<_, JobStatus>(
-        "SELECT id, status, exit_code, image, created_at FROM jobs WHERE id = ?"
-    )
+    // Dynamic SQL: SELECT ... FROM jobs WHERE id = $1
+    let query = format!(
+        "SELECT id, status, exit_code, image, created_at FROM jobs WHERE id = {}",
+        sql_placeholder(1)
+    );
+
+    let row = sqlx::query_as::<_, JobStatus>(&query)
     .bind(job_id)
     .fetch_optional(&state.db).await;
 
@@ -139,7 +165,10 @@ async fn handle_get_job_logs(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
 ) -> Response {
-    let result = sqlx::query("SELECT logs FROM jobs WHERE id = ?")
+    // Dynamic SQL: SELECT logs FROM jobs WHERE id = $1
+    let query = format!("SELECT logs FROM jobs WHERE id = {}", sql_placeholder(1));
+
+    let result = sqlx::query(&query)
         .bind(&job_id)
         .fetch_optional(&state.db)
         .await;
@@ -191,7 +220,15 @@ async fn handle_list_jobs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<JobsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT id, status, exit_code, image, created_at FROM jobs");
+    // Since we are using an alias DbPool which is conditionally compiled,
+    // we need to tell QueryBuilder which backend to use.
+    
+    #[cfg(feature = "sqlite")]
+    type BuildDb = sqlx::Sqlite;
+    #[cfg(feature = "postgres")]
+    type BuildDb = sqlx::Postgres;
+
+    let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at FROM jobs");
 
     if let Some(status) = query.status {
         q_builder.push(" WHERE status = ");
