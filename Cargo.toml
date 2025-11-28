@@ -16,7 +16,7 @@ axum-test = "18.3.0"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 
-# HTTP Client (New!) - For Webhook Callbacks
+# HTTP Client - For Webhook Callbacks
 reqwest = { version = "0.12", features = ["json"] }
 
 # Database (SQLite)
@@ -30,6 +30,10 @@ tokio-stream = { version = "0.1", optional = true }
 
 # Docker Interface
 bollard = "0.15"
+
+# Queue System (Redis)
+redis = { version = "0.32", features = ["tokio-comp"] }
+async-trait = "0.1"
 
 # Utilities
 uuid = { version = "1.10", features = ["v4", "fast-rng"] }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 // --- DATA STRUCTURES ---
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)] // ADDED Serialize here for API response
 pub struct JobLimits {
     pub memory_mb: Option<i64>,
     pub cpu_cores: Option<f32>,
@@ -28,7 +28,8 @@ pub struct JobStatus {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+// FIX: Added Serialize and Deserialize so Redis can store/retrieve this struct
+#[derive(Debug, Clone, Serialize, Deserialize)] 
 pub struct JobContext {
     pub id: String,
     pub image: String,

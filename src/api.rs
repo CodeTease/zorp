@@ -5,13 +5,14 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use axum::response::{IntoResponse, Response}; // Removed Body from here
 use std::sync::Arc;
 use sqlx::{Row, SqlitePool};
 use serde::{Deserialize};
 use uuid::Uuid;
-use tracing::{error};
+use tracing::{error, info};
 use crate::models::{JobRequest, JobContext, JobStatus};
-use crate::engine::Dispatcher;
+use crate::queue::JobQueue;
 
 #[cfg(feature = "s3_logging")]
 use aws_sdk_s3;
@@ -19,7 +20,7 @@ use aws_sdk_s3;
 // --- SHARED STATE ---
 pub struct AppState {
     pub db: SqlitePool,
-    pub dispatcher: Arc<Dispatcher>,
+    pub queue: Arc<dyn JobQueue>,
     pub secret_key: String,
 
     #[cfg(feature = "s3_logging")]
@@ -51,7 +52,7 @@ impl FromRequestParts<Arc<AppState>> for Auth {
 // --- HANDLERS ---
 
 async fn health_check() -> &'static str {
-    "Zorp v0.1.0 is running."
+    "Zorp v0.1.0 is running (Redis Enabled)."
 }
 
 async fn handle_dispatch(
@@ -61,6 +62,7 @@ async fn handle_dispatch(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let job_id = Uuid::new_v4().to_string();
     
+    // 1. Persist to DB first (Status: QUEUED)
     let insert_result = sqlx::query(
         "INSERT INTO jobs (id, status, image, commands, callback_url) VALUES (?, 'QUEUED', ?, ?, ?)"
     )
@@ -81,12 +83,27 @@ async fn handle_dispatch(
                 callback_url: payload.callback_url,
             };
 
-            state.dispatcher.dispatch(context).await;
+            // 2. Push to Redis Queue
+            match state.queue.enqueue(context).await {
+                Ok(_) => {
+                    info!("Job {} enqueued successfully via Redis", job_id);
+                    (StatusCode::ACCEPTED, Json(serde_json::json!({
+                        "status": "queued",
+                        "job_id": job_id,
+                        "message": "Job added to processing queue"
+                    })))
+                },
+                Err(e) => {
+                    error!("Redis error for job {}: {}", job_id, e);
+                    // Update DB status to FAILED if queue push fails
+                    let _ = sqlx::query("UPDATE jobs SET status = 'FAILED', logs = ? WHERE id = ?")
+                        .bind(format!("System Error: Queue unavailable - {}", e))
+                        .bind(&job_id)
+                        .execute(&state.db).await;
 
-            (StatusCode::ACCEPTED, Json(serde_json::json!({
-                "status": "queued",
-                "job_id": job_id
-            })))
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Queue unavailable"})))
+                }
+            }
         },
         Err(e) => {
             error!("Database error during dispatch: {}", e);
@@ -115,8 +132,7 @@ async fn handle_get_job(
     }
 }
 
-use axum::response::{IntoResponse, Response};
-#[allow(unused_imports)] // Để tránh warning khi feature s3 tắt (vì futures_util::TryStreamExt có thể không dùng)
+#[allow(unused_imports)] 
 use futures_util::TryStreamExt; 
 
 async fn handle_get_job_logs(
@@ -133,7 +149,6 @@ async fn handle_get_job_logs(
             let logs: Option<String> = row.get("logs");
             let log_content = logs.unwrap_or_default();
             
-            // Chỉ compile đoạn logic S3 này khi có feature
             #[cfg(feature = "s3_logging")]
             if log_content.starts_with("s3://") {
                 if let (Some(s3), Some(bucket)) = (&state.s3_client, &state.s3_bucket) {
