@@ -2,16 +2,43 @@
 name = "zorp"
 version = "0.1.0"
 edition = "2024"
-authors = ["CodeTease"] # Đã sửa tác giả
+authors = ["CodeTease"]
 description = "High-performance ephemeral CI/CD dispatcher."
+
+[dev-dependencies]
+http-body-util = "0.1.2"
+tower = { version = "0.4", features = ["util"] }
+tokio-test = "0.4.4"
+axum-test = "18.3.0"
 
 [dependencies]
 # Async Runtime & Web Server
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 
+# HTTP Client - For Webhook Callbacks
+reqwest = { version = "0.12", features = ["json"] }
+
+# Database (SQLx with conditional features)
+sqlx = { version = "0.7", features = ["runtime-tokio", "macros"] }
+
+# AWS S3 (Optional Log Storage)
+aws-config = { version = "1.5.3", optional = true }
+aws-sdk-s3 = { version = "1.40.0", optional = true }
+aws-smithy-http = { version = "0.60.9", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
 # Docker Interface
 bollard = "0.15"
+
+# Queue System (Redis)
+redis = { version = "0.32", features = ["tokio-comp", "tokio-rustls-comp"] }
+async-trait = "0.1"
+
+# CRITICAL FIX FOR REDIS TLS PANIC:
+# Redis 0.32 uses rustls 0.23 which requires an explicit crypto provider.
+# We explicitly add rustls 0.23 and enable the "ring" provider here.
+rustls = { version = "0.23", features = ["ring"] }
 
 # Utilities
 uuid = { version = "1.10", features = ["v4", "fast-rng"] }
@@ -20,3 +47,10 @@ serde_json = "1.0"
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+dotenvy = "0.15.7"
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres", "sqlx/runtime-tokio-rustls"]
+s3_logging = ["aws-config", "aws-sdk-s3", "aws-smithy-http", "tokio-stream"]
