@@ -17,22 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust cache
-        uses: actions/cache@v3
+      # MAGIC IS HERE: Smart caching for Rust
+      - name: ⚡ Cache Cargo Registry & Target
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-sqlite-${{ hashFiles('**/Cargo.lock') }}
+          # Key giúp phân biệt cache giữa các job khác nhau
+          key: "sqlite-build"
 
       - name: Check Compile (SQLite)
         run: cargo check --no-default-features --features sqlite
 
       - name: Run Unit Tests
-        # We assume unit tests don't require full Docker/Redis environment yet
-        # If they do, move this to the integration workflow
         run: cargo test --no-default-features --features sqlite
 
   # Job 2: Check compilation for Postgres
@@ -40,7 +35,6 @@ jobs:
     name: Build (Postgres)
     runs-on: ubuntu-latest
     services:
-      # Dummy postgres just in case sqlx needs to check connectivity (though you use string queries)
       postgres:
         image: postgres:15
         env:
@@ -58,15 +52,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust cache
-        uses: actions/cache@v3
+      # MAGIC IS HERE: Reuse dependencies compiled in previous runs
+      - name: ⚡ Cache Cargo Registry & Target
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-pg-${{ hashFiles('**/Cargo.lock') }}
+          key: "postgres-build"
 
       - name: Check Compile (Postgres)
         run: cargo check --no-default-features --features postgres

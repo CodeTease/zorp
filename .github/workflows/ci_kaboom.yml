@@ -11,7 +11,6 @@ jobs:
     name: Unleash Chaos
     runs-on: ubuntu-latest
     
-    # We need Redis for Zorp to function properly
     services:
       redis:
         image: redis:7-alpine
@@ -44,15 +43,25 @@ jobs:
           toolchain: stable
           override: true
 
-      # 2. Build Zorp
+      # 2. CACHE IS KING HERE 
+      # Build release tốn rất nhiều thời gian, cache là bắt buộc!
+      - name: ⚡ Cache Cargo Registry & Release Target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "chaos-release-build"
+          # Cache cả target release để lần sau chạy test nhanh như gió
+          cache-targets: "true" 
+
+      # 3. Build Zorp
       - name: Build Zorp (Release Mode)
+        # Lần chạy đầu tiên sẽ chậm, nhưng từ lần 2 sẽ bay!
         run: cargo build --release --features sqlite
 
-      # 3. Prepare Docker (Busybox for the tests)
+      # 4. Prepare Docker
       - name: Pull Test Images
         run: docker pull busybox:latest
       
-      # 4. Run Zorp in Background
+      # 5. Run Zorp in Background
       - name: Start Zorp Daemon
         env:
           ZORP_SECRET_KEY: "super-secret-ci-key"
@@ -60,27 +69,23 @@ jobs:
           REDIS_URL: "redis://localhost:6379"
           RUST_LOG: "info"
         run: |
-          # Run in background & dump logs to file
           ./target/release/zorp > zorp.log 2>&1 &
           echo "Zorp started with PID $!"
           
-          # Wait for port 3000 to be ready
           echo "Waiting for Zorp to wake up..."
           timeout 30s bash -c 'until curl -s http://localhost:3000 > /dev/null; do sleep 1; done'
           echo "Zorp is ALIVE!"
 
-      # 5. Run The Chaos Script
+      # 6. Run The Chaos Script
       - name: Execute Chaos Script
         env:
           ZORP_SECRET_KEY: "super-secret-ci-key"
         run: |
-          # Create .env file for python script since it uses load_dotenv
           echo "ZORP_SECRET_KEY=super-secret-ci-key" > .env
-          
           echo "🔥 Starting Chaos Test..."
           python test.py
 
-      # 6. Post-Mortem (If failure)
+      # 7. Post-Mortem
       - name: Dump Zorp Logs
         if: always()
         run: |
