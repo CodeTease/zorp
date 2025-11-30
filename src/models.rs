@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 // --- DATA STRUCTURES ---
+
+pub type JobRegistry = Arc<RwLock<HashMap<String, String>>>;
 
 #[derive(Debug, Deserialize, Clone, Serialize)] // ADDED Serialize here for API response
 pub struct JobLimits {
@@ -17,6 +20,8 @@ pub struct JobRequest {
     pub env: Option<HashMap<String, String>>,
     pub limits: Option<JobLimits>,
     pub callback_url: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub artifacts_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -26,6 +31,7 @@ pub struct JobStatus {
     pub exit_code: Option<i32>,
     pub image: String,
     pub created_at: String,
+    pub artifact_url: Option<String>,
 }
 
 // FIX: Added Serialize and Deserialize so Redis can store/retrieve this struct
@@ -37,4 +43,6 @@ pub struct JobContext {
     pub env: Option<HashMap<String, String>>,
     pub limits: Option<Arc<JobLimits>>,
     pub callback_url: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub artifacts_path: Option<String>,
 }

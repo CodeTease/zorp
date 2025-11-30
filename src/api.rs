@@ -2,7 +2,7 @@ use axum::{
     async_trait,
     extract::{FromRequestParts, Path, State, Json, Query},
     http::{header, request::Parts, StatusCode},
-    routing::{get, post},
+    routing::{get, post, delete},
     Router,
 };
 use axum::response::{IntoResponse, Response}; 
@@ -11,9 +11,11 @@ use sqlx::Row;
 use serde::{Deserialize};
 use uuid::Uuid;
 use tracing::{error, info};
-use crate::models::{JobRequest, JobContext, JobStatus};
+use bollard::Docker;
+use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry};
 use crate::queue::JobQueue;
 use crate::db::{DbPool, sql_placeholder};
+use crate::engine;
 
 #[cfg(feature = "s3_logging")]
 use aws_sdk_s3;
@@ -26,6 +28,8 @@ pub struct AppState {
     pub db: DbPool,
     pub queue: Arc<dyn JobQueue>,
     pub secret_key: String,
+    pub docker: Docker,
+    pub job_registry: JobRegistry,
 
     #[cfg(feature = "s3_logging")]
     pub s3_client: Option<aws_sdk_s3::Client>,
@@ -96,6 +100,8 @@ async fn handle_dispatch(
                 env: payload.env,
                 limits: payload.limits.map(Arc::new),
                 callback_url: payload.callback_url,
+                timeout_seconds: payload.timeout_seconds,
+                artifacts_path: payload.artifacts_path,
             };
 
             // 2. Push to Redis Queue
@@ -131,6 +137,25 @@ async fn handle_dispatch(
             error!("Database error during dispatch: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to persist job"})))
         }
+    }
+}
+
+async fn handle_cancel_job(
+    State(state): State<Arc<AppState>>,
+    _: Auth,
+    Path(job_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match engine::cancel_job(&state.docker, &state.job_registry, &job_id, &state.db).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({
+            "status": "cancelled",
+            "job_id": job_id,
+            "message": "Job cancellation initiated successfully"
+        }))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "Job not found running",
+            "message": "The job is not currently running in the active registry."
+        }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))
     }
 }
 
@@ -255,7 +280,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health_check))
         .route("/dispatch", post(handle_dispatch))
-        .route("/job/:id", get(handle_get_job))
+        .route("/job/:id", delete(handle_cancel_job).get(handle_get_job))
         .route("/job/:id/logs", get(handle_get_job_logs))
         .route("/jobs", get(handle_list_jobs))
         .with_state(state)

@@ -17,6 +17,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info}; 
 use crate::queue::{RedisQueue, JobQueue};
+use crate::models::JobRegistry;
+use tokio::sync::RwLock;
+use std::collections::HashMap;
 
 const PORT: u16 = 3000;
 const MAX_CONCURRENT_JOBS: usize = 50;
@@ -59,8 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Initialize Docker
     let docker = Docker::connect_with_local_defaults()?;
 
-    // 4. Run Zombie Reaper
-    engine::startup_reaper(&docker, &db_pool).await;
+    // 3b. Initialize JobRegistry
+    let job_registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+    // 4. Run Zombie Reaper (Background Task)
+    engine::spawn_reaper_task(docker.clone(), db_pool.clone());
 
     // 5. Initialize Engine (Dispatcher)
     let http_client = reqwest::Client::builder()
@@ -97,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db_pool.clone(),
         http_client,
         MAX_CONCURRENT_JOBS,
+        job_registry.clone(),
         #[cfg(feature = "s3_logging")]
         s3_client.clone(),
         #[cfg(feature = "s3_logging")]
@@ -131,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: db_pool,
         queue: queue,
         secret_key,
+        docker: docker,
+        job_registry: job_registry,
         #[cfg(feature = "s3_logging")]
         s3_client,
         #[cfg(feature = "s3_logging")]
