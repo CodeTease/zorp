@@ -1,0 +1,72 @@
+name: Bloop Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Job 1: Check compilation for SQLite (Default)
+  build-sqlite:
+    name: Build (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-sqlite-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check Compile (SQLite)
+        run: cargo check --no-default-features --features sqlite
+
+      - name: Run Unit Tests
+        # We assume unit tests don't require full Docker/Redis environment yet
+        # If they do, move this to the integration workflow
+        run: cargo test --no-default-features --features sqlite
+
+  # Job 2: Check compilation for Postgres
+  build-postgres:
+    name: Build (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      # Dummy postgres just in case sqlx needs to check connectivity (though you use string queries)
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: zorp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pg-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check Compile (Postgres)
+        run: cargo check --no-default-features --features postgres
