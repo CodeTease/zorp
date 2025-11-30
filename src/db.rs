@@ -64,11 +64,15 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
                 commands TEXT NOT NULL,
                 logs TEXT,
                 callback_url TEXT,
+                artifact_url TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             "#
         )
         .execute(&pool).await?;
+
+        // Simple migration for existing databases
+        let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN artifact_url TEXT").execute(&pool).await;
 
         return Ok(pool);
     }
@@ -107,11 +111,15 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
                 commands TEXT NOT NULL,
                 logs TEXT,
                 callback_url TEXT,
+                artifact_url TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
             "#
         )
         .execute(&pool).await?;
+
+        // Simple migration for existing databases
+        let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN artifact_url TEXT").execute(&pool).await;
 
         return Ok(pool);
     }
