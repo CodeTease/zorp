@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use crate::models::JobContext;
+use tracing::{info, warn};
 
 // FIX: Added `+ Send + Sync` to the Boxed Error.
 // This is critical for tokio::spawn to accept the Result containing this error across threads.
@@ -8,12 +9,15 @@ use crate::models::JobContext;
 pub trait JobQueue: Send + Sync {
     async fn enqueue(&self, job: JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn dequeue(&self) -> Result<Option<JobContext>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn acknowledge(&self, job: &JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn restore_stranded(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // --- REDIS IMPLEMENTATION ---
 pub struct RedisQueue {
     client: redis::Client,
     queue_name: String,
+    processing_queue_name: String,
 }
 
 impl RedisQueue {
@@ -22,6 +26,7 @@ impl RedisQueue {
         Self {
             client,
             queue_name: "zorp_jobs".to_string(),
+            processing_queue_name: "zorp_jobs:processing".to_string(),
         }
     }
 }
@@ -46,17 +51,61 @@ impl JobQueue for RedisQueue {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         
-        // BRPOP: Block connection until an item is available (timeout = 0 means wait indefinitely)
-        let result: Option<(String, String)> = conn.brpop(&self.queue_name, 0.0).await
+        // Reliable Queue: BRPOPLPUSH source destination timeout
+        // Moves item from tail of source to head of destination safely.
+        let payload: Option<String> = conn.brpoplpush(&self.queue_name, &self.processing_queue_name, 0.0).await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        match result {
-            Some((_, payload)) => {
-                let job: JobContext = serde_json::from_str(&payload)
+        match payload {
+            Some(payload_str) => {
+                let job: JobContext = serde_json::from_str(&payload_str)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 Ok(Some(job))
             }
             None => Ok(None),
         }
+    }
+
+    async fn acknowledge(&self, job: &JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+         let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+         // We must use the exact string representation to remove it.
+         let payload = serde_json::to_string(job)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+         // LREM key count value. count > 0: Remove elements equal to value moving from head to tail.
+         let removed: i64 = conn.lrem(&self.processing_queue_name, 1, payload).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+         if removed == 0 {
+             warn!("Could not acknowledge job {}. It might have been already removed or modified.", job.id);
+         }
+         
+         Ok(())
+    }
+
+    async fn restore_stranded(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let mut count = 0;
+        loop {
+            // RPOPLPUSH from processing back to queue.
+            // Returns the element being popped. If None, list is empty.
+            let item: Option<String> = conn.rpoplpush(&self.processing_queue_name, &self.queue_name).await
+                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+            match item {
+                Some(_) => count += 1,
+                None => break,
+            }
+        }
+        
+        if count > 0 {
+            info!("Restored {} stranded jobs from '{}' to '{}'", count, self.processing_queue_name, self.queue_name);
+        }
+        
+        Ok(count)
     }
 }

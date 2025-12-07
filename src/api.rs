@@ -18,6 +18,7 @@ use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, StreamRegist
 use crate::queue::JobQueue;
 use crate::db::{DbPool, sql_placeholder};
 use crate::engine;
+use crate::metrics;
 
 use aws_sdk_s3;
 use axum::body::Body;
@@ -69,6 +70,10 @@ async fn health_check() -> &'static str {
     }
 }
 
+async fn handle_metrics() -> String {
+    metrics::get_metrics()
+}
+
 async fn handle_dispatch(
     State(state): State<Arc<AppState>>,
     _: Auth,
@@ -111,6 +116,7 @@ async fn handle_dispatch(
             match state.queue.enqueue(context).await {
                 Ok(_) => {
                     info!("Job {} enqueued successfully via Redis", job_id);
+                    metrics::inc_queued();
                     (StatusCode::ACCEPTED, Json(serde_json::json!({
                         "status": "queued",
                         "job_id": job_id,
@@ -314,6 +320,7 @@ async fn handle_list_jobs(
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health_check))
+        .route("/metrics", get(handle_metrics))
         .route("/dispatch", post(handle_dispatch))
         .route("/job/:id", delete(handle_cancel_job).get(handle_get_job))
         .route("/job/:id/logs", get(handle_get_job_logs))

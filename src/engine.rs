@@ -1,20 +1,24 @@
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
     StartContainerOptions, WaitContainerOptions, DownloadFromContainerOptions, ListContainersOptions,
+    StopContainerOptions, PruneContainersOptions,
 };
-use bollard::image::CreateImageOptions;
+use bollard::image::{CreateImageOptions, PruneImagesOptions};
+use bollard::volume::PruneVolumesOptions;
 use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::TryStreamExt; 
 use futures_util::StreamExt;    
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tokio::sync::Semaphore;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tracing::{info, warn, error};
 use crate::models::{JobContext, JobRegistry, StreamRegistry};
 use crate::db::{DbPool, sql_placeholder};
+use crate::queue::JobQueue;
+use crate::metrics;
 use tokio::sync::broadcast;
 use bollard::network::CreateNetworkOptions;
 use hmac::{Hmac, Mac};
@@ -38,15 +42,20 @@ pub async fn cancel_job(
     };
 
     if let Some(container_id) = container_name {
-        info!("Cancellation requested for job {}. Killing container {}...", job_id, container_id);
+        info!("Cancellation requested for job {}. Stopping container {} (Grace period: 10s)...", job_id, container_id);
 
-        match docker.kill_container::<String>(&container_id, None).await {
+        // Graceful Cancellation: Stop container with timeout (SIGTERM -> SIGKILL)
+        let stop_opts = StopContainerOptions { t: 10 }; 
+        match docker.stop_container(&container_id, Some(stop_opts)).await {
             Ok(_) => {
-                info!("Container {} killed successfully.", container_id);
+                info!("Container {} stopped successfully.", container_id);
             }
             Err(e) => {
-                // It might have already finished
-                warn!("Failed to kill container {}: {}", container_id, e);
+                warn!("Failed to gracefully stop container {}: {}. Attempting forced kill...", container_id, e);
+                // Fallback to kill if stop fails (e.g. timeout or error)
+                if let Err(k_e) = docker.kill_container::<String>(&container_id, None).await {
+                     warn!("Failed to kill container {}: {}", container_id, k_e);
+                }
             }
         }
 
@@ -65,12 +74,17 @@ pub async fn cancel_job(
     Ok(false)
 }
 
-// --- THE ZOMBIE REAPER ---
+// --- THE ZOMBIE REAPER & GARBAGE COLLECTOR ---
 pub fn spawn_reaper_task(docker: Docker, db: DbPool) {
     tokio::spawn(async move {
-        info!("逐 Zombie Reaper task started (Interval: 1m).");
+        info!("逐 Zombie Reaper & Garbage Collector task started.");
         loop {
+            // Reap Zombies (every 60s)
             reap_zombies(&docker, &db).await;
+            
+            // Garbage Collection (Temp files & Pruning)
+            garbage_collection(&docker).await;
+
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
@@ -120,6 +134,43 @@ async fn reap_zombies(docker: &Docker, db: &DbPool) {
     }
 }
 
+async fn garbage_collection(docker: &Docker) {
+    // 1. Clean up stale /tmp files (logs & artifacts) older than 1 hour
+    let tmp_dir = std::path::Path::new("/tmp");
+    if let Ok(mut entries) = tokio::fs::read_dir(tmp_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("zorp-") {
+                    if let Ok(metadata) = entry.metadata().await {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(age) = SystemTime::now().duration_since(modified) {
+                                if age > std::time::Duration::from_secs(3600) {
+                                    info!("🧹 GC: Removing stale file {:?}", path);
+                                    let _ = tokio::fs::remove_file(path).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Prune Docker Resources
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
+    
+    // Prune containers
+    let _ = docker.prune_containers(Some(PruneContainersOptions { filters: filters.clone() })).await;
+
+    // Prune images (dangling)
+    let _ = docker.prune_images(Some(PruneImagesOptions::<String> { filters: std::collections::HashMap::new() })).await; 
+    
+    // Prune volumes
+    let _ = docker.prune_volumes(Some(PruneVolumesOptions::<String> { filters: std::collections::HashMap::new() })).await;
+}
+
 // --- DISPATCHER LOGIC ---
 
 pub struct Dispatcher {
@@ -132,6 +183,7 @@ pub struct Dispatcher {
     s3_client: Option<aws_sdk_s3::Client>,
     s3_bucket: Option<String>,
     secret_key: String,
+    queue: Arc<dyn JobQueue>,
 }
 
 impl Dispatcher {
@@ -145,6 +197,7 @@ impl Dispatcher {
         s3_client: aws_sdk_s3::Client,
         s3_bucket: String,
         secret_key: String,
+        queue: Arc<dyn JobQueue>,
     ) -> Self {
         Self {
             docker,
@@ -156,6 +209,7 @@ impl Dispatcher {
             s3_client: Some(s3_client),
             s3_bucket: Some(s3_bucket),
             secret_key,
+            queue,
         }
     }
 
@@ -169,9 +223,13 @@ impl Dispatcher {
         let s3_client = self.s3_client.clone();
         let s3_bucket = self.s3_bucket.clone();
         let secret_key = self.secret_key.clone();
+        let queue = self.queue.clone();
         
         tokio::spawn(async move {
             let _permit = permit; 
+            metrics::inc_running();
+            metrics::dec_queued(); // It was queued, now running
+
             let start_time = Instant::now();
             let container_name = format!("zorp-{}", job.id);
 
@@ -204,7 +262,7 @@ impl Dispatcher {
             let mut log_file_path = String::new();
             let mut final_artifact_url = String::new();
 
-            let env_vars: Option<Vec<String>> = job.env.map(|map| {
+            let env_vars: Option<Vec<String>> = job.env.as_ref().map(|map| {
                 map.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
             });
 
@@ -252,6 +310,8 @@ impl Dispatcher {
                         pids_limit: Some(100),
                         // Network Isolation
                         network_mode: Some(ZORP_NETWORK_NAME.to_string()),
+                        // Extra Hosts: Block metadata service
+                        extra_hosts: Some(vec!["169.254.169.254:127.0.0.1".to_string()]),
                         ..Default::default()
                     }),
                     // Configurable User
@@ -394,7 +454,16 @@ impl Dispatcher {
 
             if final_status != "TIMED_OUT" && final_status != "FAILED" && final_exit_code != 0 {
                  final_status = "FAILED";
+            } else if final_exit_code != 0 {
+                 final_status = "FAILED";
             }
+
+            if final_status == "FAILED" || final_status == "TIMED_OUT" || final_status == "CANCELLED" {
+                metrics::inc_failed();
+            } else {
+                metrics::inc_completed();
+            }
+            metrics::dec_running();
 
             let duration = start_time.elapsed().as_secs_f64();
 
@@ -458,6 +527,13 @@ impl Dispatcher {
             }
 
             info!("[{}] Status: {} (Exit: {}). Time: {:.2}s", job.id, final_status, final_exit_code, duration);
+
+            // Acknowledge the job in the queue (Remove from processing queue)
+            if let Err(e) = queue.acknowledge(&job).await {
+                error!("[{}] Failed to acknowledge job in queue: {}", job.id, e);
+            } else {
+                info!("[{}] Job acknowledged in queue.", job.id);
+            }
 
             if let Some(url) = job.callback_url {
                 let payload = serde_json::json!({

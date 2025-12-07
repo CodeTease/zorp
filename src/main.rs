@@ -6,6 +6,7 @@ mod db;
 mod engine;
 mod models;
 mod queue;
+mod metrics; // Added metrics module
 
 use bollard::Docker;
 use dotenvy::dotenv;
@@ -55,6 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let queue = Arc::new(RedisQueue::new(&redis_url));
     info!("Connected to Redis Queue successfully.");
+
+    // Restore stranded jobs
+    info!("🔎 Checking for stranded jobs in processing queue...");
+    match queue.restore_stranded().await {
+        Ok(0) => info!("✅ No stranded jobs found."),
+        Ok(count) => info!("♻️  Restored {} stranded jobs to the main queue.", count),
+        Err(e) => error!("❌ Failed to restore stranded jobs: {}", e),
+    }
 
     // 3. Initialize Docker
     let docker = Docker::connect_with_local_defaults()?;
@@ -140,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         s3_client.clone(),
         s3_bucket.clone(),
         secret_key.clone(),
+        queue.clone(),
     ));
 
     // 6. Spawn WORKER THREAD (with Graceful Shutdown support)
