@@ -6,34 +6,32 @@ use axum::{
     Router,
 };
 use axum::response::{IntoResponse, Response}; 
+use axum::response::sse::{Event, Sse};
+use futures_util::stream::Stream;
 use std::sync::Arc;
 use sqlx::Row;
 use serde::{Deserialize};
 use uuid::Uuid;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use bollard::Docker;
-use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry};
+use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, StreamRegistry};
 use crate::queue::JobQueue;
 use crate::db::{DbPool, sql_placeholder};
 use crate::engine;
 
-#[cfg(feature = "s3_logging")]
 use aws_sdk_s3;
-#[cfg(feature = "s3_logging")]
 use axum::body::Body;
+use std::convert::Infallible;
 
 // --- SHARED STATE ---
-// Uses the DbPool type alias (either SqlitePool or PgPool)
 pub struct AppState {
     pub db: DbPool,
     pub queue: Arc<dyn JobQueue>,
     pub secret_key: String,
     pub docker: Docker,
     pub job_registry: JobRegistry,
-
-    #[cfg(feature = "s3_logging")]
+    pub stream_registry: StreamRegistry,
     pub s3_client: Option<aws_sdk_s3::Client>,
-    #[cfg(feature = "s3_logging")]
     pub s3_bucket: Option<String>,
 }
 
@@ -61,10 +59,14 @@ impl FromRequestParts<Arc<AppState>> for Auth {
 
 async fn health_check() -> &'static str {
     #[cfg(feature = "postgres")]
-    return "Zorp v0.1.0 is running (PostgreSQL + Redis).";
+    {
+        return "Zorp v0.1.0 is running (PostgreSQL + Redis).";
+    }
     
-    #[cfg(feature = "sqlite")]
-    return "Zorp v0.1.0 is running (SQLite + Redis).";
+    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+    {
+        return "Zorp v0.1.0 is running (SQLite + Redis).";
+    }
 }
 
 async fn handle_dispatch(
@@ -102,6 +104,7 @@ async fn handle_dispatch(
                 callback_url: payload.callback_url,
                 timeout_seconds: payload.timeout_seconds,
                 artifacts_path: payload.artifacts_path,
+                user: payload.user,
             };
 
             // 2. Push to Redis Queue
@@ -203,7 +206,6 @@ async fn handle_get_job_logs(
             let logs: Option<String> = row.get("logs");
             let log_content = logs.unwrap_or_default();
             
-            #[cfg(feature = "s3_logging")]
             if log_content.starts_with("s3://") {
                 if let (Some(s3), Some(bucket)) = (&state.s3_client, &state.s3_bucket) {
                     let key = log_content.replace(&format!("s3://{}/", bucket), "");
@@ -222,6 +224,8 @@ async fn handle_get_job_logs(
                             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Failed to retrieve logs from S3" }))).into_response();
                         }
                     }
+                } else {
+                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "S3 configuration missing" }))).into_response();
                 }
             }
 
@@ -235,6 +239,38 @@ async fn handle_get_job_logs(
     }
 }
 
+// --- SSE LOG STREAMING ---
+async fn handle_stream_logs(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    info!("Client connected to stream logs for job: {}", job_id);
+
+    // Try to get broadcast receiver from registry
+    let rx = {
+        let registry = state.stream_registry.read().await;
+        registry.get(&job_id).map(|tx| tx.subscribe())
+    };
+
+    let stream = async_stream::stream! {
+        if let Some(mut rx) = rx {
+            // Job is running, stream live logs
+            while let Ok(msg) = rx.recv().await {
+                yield Ok(Event::default().data(msg));
+            }
+            yield Ok(Event::default().data("[Stream Ended: Job Finished]"));
+        } else {
+            // Job not running or not found.
+            // Check if it's finished by querying DB?
+            // For now just say it's not live.
+            yield Ok(Event::default().data("[Error: Job is not running or live stream unavailable. Check /logs endpoint.]"));
+        }
+    };
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+
 #[derive(Deserialize)]
 struct JobsQuery {
     limit: Option<i64>,
@@ -245,13 +281,12 @@ async fn handle_list_jobs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<JobsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Since we are using an alias DbPool which is conditionally compiled,
-    // we need to tell QueryBuilder which backend to use.
     
-    #[cfg(feature = "sqlite")]
-    type BuildDb = sqlx::Sqlite;
     #[cfg(feature = "postgres")]
     type BuildDb = sqlx::Postgres;
+
+    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+    type BuildDb = sqlx::Sqlite;
 
     let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at FROM jobs");
 
@@ -282,6 +317,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/dispatch", post(handle_dispatch))
         .route("/job/:id", delete(handle_cancel_job).get(handle_get_job))
         .route("/job/:id/logs", get(handle_get_job_logs))
+        .route("/job/:id/stream", get(handle_stream_logs))
         .route("/jobs", get(handle_list_jobs))
         .with_state(state)
 }

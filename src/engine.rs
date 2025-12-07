@@ -13,11 +13,17 @@ use tokio::sync::Semaphore;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tracing::{info, warn, error};
-use crate::models::{JobContext, JobRegistry};
+use crate::models::{JobContext, JobRegistry, StreamRegistry};
 use crate::db::{DbPool, sql_placeholder};
+use tokio::sync::broadcast;
+use bollard::network::CreateNetworkOptions;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use hex;
 
-#[cfg(feature = "s3_logging")]
 use aws_sdk_s3;
+
+const ZORP_NETWORK_NAME: &str = "zorp-net";
 
 // --- CANCEL JOB LOGIC ---
 pub async fn cancel_job(
@@ -122,11 +128,10 @@ pub struct Dispatcher {
     http_client: reqwest::Client,
     limiter: Arc<Semaphore>,
     job_registry: JobRegistry,
-
-    #[cfg(feature = "s3_logging")]
+    stream_registry: StreamRegistry,
     s3_client: Option<aws_sdk_s3::Client>,
-    #[cfg(feature = "s3_logging")]
     s3_bucket: Option<String>,
+    secret_key: String,
 }
 
 impl Dispatcher {
@@ -136,8 +141,10 @@ impl Dispatcher {
         http_client: reqwest::Client, 
         max_concurrent: usize,
         job_registry: JobRegistry,
-        #[cfg(feature = "s3_logging")] s3_client: Option<aws_sdk_s3::Client>,
-        #[cfg(feature = "s3_logging")] s3_bucket: Option<String>,
+        stream_registry: StreamRegistry,
+        s3_client: aws_sdk_s3::Client,
+        s3_bucket: String,
+        secret_key: String,
     ) -> Self {
         Self {
             docker,
@@ -145,10 +152,10 @@ impl Dispatcher {
             http_client,
             limiter: Arc::new(Semaphore::new(max_concurrent)),
             job_registry,
-            #[cfg(feature = "s3_logging")]
-            s3_client,
-            #[cfg(feature = "s3_logging")]
-            s3_bucket,
+            stream_registry,
+            s3_client: Some(s3_client),
+            s3_bucket: Some(s3_bucket),
+            secret_key,
         }
     }
 
@@ -158,11 +165,10 @@ impl Dispatcher {
         let db = self.db.clone();
         let http_client = self.http_client.clone();
         let job_registry = self.job_registry.clone();
-        
-        #[cfg(feature = "s3_logging")]
+        let stream_registry = self.stream_registry.clone();
         let s3_client = self.s3_client.clone();
-        #[cfg(feature = "s3_logging")]
         let s3_bucket = self.s3_bucket.clone();
+        let secret_key = self.secret_key.clone();
         
         tokio::spawn(async move {
             let _permit = permit; 
@@ -175,6 +181,13 @@ impl Dispatcher {
                 reg.insert(job.id.clone(), container_name.clone());
             }
 
+            // Create broadcast channel for streaming logs
+            let (tx, _) = broadcast::channel(100);
+            {
+                let mut s_reg = stream_registry.write().await;
+                s_reg.insert(job.id.clone(), tx.clone());
+            }
+
             // Dynamic SQL: UPDATE jobs SET status = 'RUNNING' WHERE id = $1
             let update_running = format!("UPDATE jobs SET status = 'RUNNING' WHERE id = {}", sql_placeholder(1));
             let _ = sqlx::query(&update_running)
@@ -182,6 +195,7 @@ impl Dispatcher {
                 .execute(&db).await;
 
             info!("[{}] Status: RUNNING", job.id);
+            let _ = tx.send(format!("INFO: Job {} started.\n", job.id));
 
             let mut final_status = "FINISHED";
             let mut final_exit_code = 0;
@@ -202,8 +216,19 @@ impl Dispatcher {
                 .and_then(|l| l.cpu_cores)
                 .map(|cores| (cores * 100000.0) as i64);
 
+            // Ensure Network Exists
+            if let Err(_) = docker.inspect_network::<String>(ZORP_NETWORK_NAME, None).await {
+                let _ = docker.create_network(CreateNetworkOptions {
+                    name: ZORP_NETWORK_NAME,
+                    driver: "bridge",
+                    check_duplicate: true,
+                    ..Default::default()
+                }).await;
+            }
+
             if let Err(e) = ensure_image(&docker, &job.image).await {
                 error!("[{}] Image pull failed: {}", job.id, e);
+                let _ = tx.send(format!("ERROR: Image pull failed: {}\n", e));
                 final_status = "FAILED";
                 final_exit_code = -1;
                 webhook_logs = format!("System Error: Image pull failed. {}", e);
@@ -225,14 +250,12 @@ impl Dispatcher {
                         readonly_rootfs: Some(true),
                         cap_drop: Some(vec!["ALL".to_string()]),
                         pids_limit: Some(100),
-                        // We might need to keep CapAdd empty or minimal.
-                        // If user needs specific caps, they aren't in JobRequest yet.
+                        // Network Isolation
+                        network_mode: Some(ZORP_NETWORK_NAME.to_string()),
                         ..Default::default()
                     }),
-                    // Run as non-root (nobody:nogroup usually 65534:65534 or 1000:1000)
-                    // But depends on image. If image doesn't have user, might fail?
-                    // "Non-root User" prompt. "Configure Docker to run process with UID != 0".
-                    user: Some("1000:1000".to_string()),
+                    // Configurable User
+                    user: job.user.clone(),
                     tty: Some(false),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
@@ -246,6 +269,7 @@ impl Dispatcher {
                     Ok(_) => {
                         if let Err(e) = docker.start_container(&container_name, None::<StartContainerOptions<String>>).await {
                              error!("[{}] Start failed: {}", job.id, e);
+                             let _ = tx.send(format!("ERROR: Container start failed: {}\n", e));
                              final_status = "FAILED";
                              final_exit_code = -2;
                              webhook_logs = format!("Error: Start failed: {}", e);
@@ -272,9 +296,11 @@ impl Dispatcher {
                                         Some(Ok(r)) => {
                                             final_exit_code = r.status_code as i32;
                                             info!("[{}] Container exited with {}", job.id, final_exit_code);
+                                            let _ = tx.send(format!("INFO: Container exited with code {}\n", final_exit_code));
                                         }
                                         Some(Err(e)) => {
                                             error!("[{}] Wait stream error: {}", job.id, e);
+                                            let _ = tx.send(format!("ERROR: Wait stream error: {}\n", e));
                                             final_status = "FAILED";
                                             final_exit_code = -99;
                                         }
@@ -292,16 +318,18 @@ impl Dispatcher {
                                 _ = timeout_fut => {
                                     // Timeout
                                     info!("[{}] Timeout reached. Killing...", job.id);
+                                    let _ = tx.send("ERROR: Timeout reached. Killing container.\n".to_string());
                                     let _ = docker.kill_container::<String>(&container_name, None).await;
                                     final_status = "TIMED_OUT";
                                 }
                             }
 
-                            // Collect logs to file
-                            log_file_path = stream_logs_to_file(&docker, &container_name, &job.id).await;
+                            // Collect logs to file (and stream)
+                            log_file_path = stream_logs_to_file_and_broadcast(&docker, &container_name, &job.id, &tx).await;
 
                             // Collect Artifacts
                             if let Some(art_path) = &job.artifacts_path {
+                                let _ = tx.send("INFO: Collecting artifacts...\n".to_string());
                                 let options = Some(DownloadFromContainerOptions { path: art_path.clone() });
                                 let mut stream = docker.download_from_container(&container_name, options);
 
@@ -322,7 +350,6 @@ impl Dispatcher {
                                     }
 
                                     if success {
-                                        #[cfg(feature = "s3_logging")]
                                         if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
                                             let key = format!("artifacts/{}.tar", job.id);
                                              match aws_sdk_s3::primitives::ByteStream::from_path(path_ref).await {
@@ -330,6 +357,7 @@ impl Dispatcher {
                                                      if let Ok(_) = s3.put_object().bucket(bucket).key(&key).body(bs).send().await {
                                                          final_artifact_url = format!("s3://{}/{}", bucket, key);
                                                          info!("[{}] Artifact uploaded: {}", job.id, final_artifact_url);
+                                                         let _ = tx.send(format!("INFO: Artifact uploaded to {}\n", final_artifact_url));
                                                      }
                                                  },
                                                  Err(e) => error!("Failed to read artifact file: {}", e)
@@ -343,6 +371,7 @@ impl Dispatcher {
                     }
                     Err(e) => {
                          error!("[{}] Create failed: {}", job.id, e);
+                         let _ = tx.send(format!("ERROR: Create container failed: {}\n", e));
                         final_status = "FAILED";
                         final_exit_code = -3;
                         webhook_logs = format!("Error: Container creation failed: {}", e);
@@ -353,67 +382,62 @@ impl Dispatcher {
             }
 
             // Clean up registry
-            let removed_self = {
+            {
                 let mut reg = job_registry.write().await;
-                reg.remove(&job.id).is_some()
-            };
+                reg.remove(&job.id);
+            }
+            // Clean up stream registry
+            {
+                let mut s_reg = stream_registry.write().await;
+                s_reg.remove(&job.id);
+            }
 
-            if !removed_self && final_status != "TIMED_OUT" {
-                final_status = "CANCELLED";
+            if final_status != "TIMED_OUT" && final_status != "FAILED" && final_exit_code != 0 {
+                 final_status = "FAILED";
             }
 
             let duration = start_time.elapsed().as_secs_f64();
 
-            // --- LOGS PERSISTENCE ---
-            let mut final_log_ref = webhook_logs.clone();
+            // --- LOGS PERSISTENCE (MANDATORY S3) ---
+            let mut final_log_ref = String::new();
 
             // If we have a log file, process it
             if !log_file_path.is_empty() {
-                // If S3 enabled, try upload
-                #[cfg(feature = "s3_logging")]
-                {
-                    if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
-                        let key = format!("logs/{}.txt", job.id);
-                        let path_ref = std::path::Path::new(&log_file_path);
+                if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
+                    let key = format!("logs/{}.txt", job.id);
+                    let path_ref = std::path::Path::new(&log_file_path);
 
-                        match aws_sdk_s3::primitives::ByteStream::from_path(path_ref).await {
-                            Ok(byte_stream) => {
-                                info!("[{}] Uploading logs to S3...", job.id);
-                                match s3.put_object().bucket(bucket).key(&key).body(byte_stream).send().await {
-                                    Ok(_) => {
-                                        final_log_ref = format!("s3://{}/{}", bucket, key);
-                                        webhook_logs = final_log_ref.clone(); // Webhook gets the URL
-                                        info!("[{}] S3 upload successful.", job.id);
-                                    }
-                                    Err(e) => error!("S3 upload failed: {}", e)
+                    match aws_sdk_s3::primitives::ByteStream::from_path(path_ref).await {
+                        Ok(byte_stream) => {
+                            info!("[{}] Uploading logs to S3...", job.id);
+                            match s3.put_object().bucket(bucket).key(&key).body(byte_stream).send().await {
+                                Ok(_) => {
+                                    final_log_ref = format!("s3://{}/{}", bucket, key);
+                                    webhook_logs = final_log_ref.clone(); // Webhook gets the URL
+                                    info!("[{}] S3 upload successful.", job.id);
                                 }
-                            },
-                            Err(e) => error!("Failed to read log file for S3 upload: {}", e)
+                                Err(e) => {
+                                    error!("S3 upload failed: {}", e);
+                                    final_status = "FAILED"; // Mark job as failed if logs cannot be preserved
+                                    webhook_logs = format!("System Error: Log upload failed. {}", e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to read log file for S3 upload: {}", e);
+                            final_status = "FAILED";
                         }
                     }
-                }
-
-                // If final_log_ref is still empty (no S3 or failed), read file content
-                if final_log_ref.is_empty() {
-                     match File::open(&log_file_path).await {
-                         Ok(mut file) => {
-                             // Truncate to 1MB to avoid OOM
-                             let mut content = String::new();
-                             let mut handle = file.take(1024 * 1024); // 1MB
-                             if let Ok(_) = handle.read_to_string(&mut content).await {
-                                 if content.len() >= 1024 * 1024 {
-                                     content.push_str("\n[Logs truncated due to size limit]");
-                                 }
-                                 final_log_ref = content.clone();
-                                 webhook_logs = content;
-                             }
-                         },
-                         Err(e) => error!("Failed to open log file back: {}", e)
-                     }
+                } else {
+                    error!("S3 Client not available despite being mandatory!");
+                    final_status = "FAILED";
                 }
 
                 // Remove temp file
                 let _ = tokio::fs::remove_file(&log_file_path).await;
+            } else if final_status != "FAILED" && final_status != "CANCELLED" {
+                // No logs generated?
+                warn!("[{}] No logs were generated or captured.", job.id);
             }
 
             // Dynamic SQL: UPDATE jobs SET status = $1, exit_code = $2, logs = $3, artifact_url = $4 WHERE id = $5
@@ -444,11 +468,34 @@ impl Dispatcher {
                     "logs": webhook_logs
                 });
 
-                let send_result = http_client.post(&url).json(&payload).send().await;
+                // SIGNATURE GENERATION
+                let mut headers = reqwest::header::HeaderMap::new();
+                if let Ok(payload_str) = serde_json::to_string(&payload) {
+                     type HmacSha256 = Hmac<Sha256>;
+                     if let Ok(mut mac) = HmacSha256::new_from_slice(secret_key.as_bytes()) {
+                         mac.update(payload_str.as_bytes());
+                         let result = mac.finalize();
+                         let signature = hex::encode(result.into_bytes());
+                         if let Ok(hv) = reqwest::header::HeaderValue::from_str(&signature) {
+                             headers.insert("X-Zorp-Signature", hv);
+                         }
+                     }
+                }
+
+                let send_result = http_client.post(&url)
+                    .headers(headers.clone())
+                    .json(&payload)
+                    .send()
+                    .await;
+                
                 if let Err(e) = send_result {
                      warn!("[{}] Webhook failed (1/2): {}. Retrying...", job.id, e);
                      tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                     let _ = http_client.post(&url).json(&payload).send().await
+                     let _ = http_client.post(&url)
+                         .headers(headers)
+                         .json(&payload)
+                         .send()
+                         .await
                          .map_err(|e2| error!("[{}] Webhook failed (2/2): {}", job.id, e2));
                 }
             }
@@ -466,7 +513,7 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<(), bollard::error
     Ok(())
 }
 
-async fn stream_logs_to_file(docker: &Docker, name: &str, job_id: &str) -> String {
+async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: &str, tx: &broadcast::Sender<String>) -> String {
     let filename = format!("/tmp/zorp-{}.log", job_id);
     let path = std::path::Path::new(&filename);
 
@@ -489,10 +536,16 @@ async fn stream_logs_to_file(docker: &Docker, name: &str, job_id: &str) -> Strin
             LogOutput::StdErr { message } => message,
             _ => continue,
         };
+        
+        // Write to file
         if let Err(e) = file.write_all(&msg).await {
              error!("Failed to write to log file: {}", e);
-             break;
         }
+
+        // Broadcast to real-time subscribers
+        // We convert bytes to string lossily
+        let log_str = String::from_utf8_lossy(&msg).to_string();
+        let _ = tx.send(log_str);
     }
 
     filename

@@ -2,10 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 
 // --- DATA STRUCTURES ---
 
 pub type JobRegistry = Arc<RwLock<HashMap<String, String>>>;
+
+// Stream Registry: Map<JobId, BroadcastSender<String>>
+// Used for real-time log streaming
+pub type StreamRegistry = Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>;
 
 #[derive(Debug, Deserialize, Clone, Serialize)] // ADDED Serialize here for API response
 pub struct JobLimits {
@@ -22,6 +27,7 @@ pub struct JobRequest {
     pub callback_url: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
+    pub user: Option<String>, // New field for configurable user
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -45,4 +51,5 @@ pub struct JobContext {
     pub callback_url: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
+    pub user: Option<String>, // New field for configurable user
 }

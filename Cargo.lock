@@ -4484,6 +4484,7 @@ dependencies = [
 name = "zorp"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -4493,12 +4494,15 @@ dependencies = [
  "bollard",
  "dotenvy",
  "futures-util",
+ "hex",
+ "hmac",
  "http-body-util",
  "redis",
  "reqwest",
  "rustls 0.23.35",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "tokio-stream",

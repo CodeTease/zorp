@@ -11,15 +11,16 @@ use bollard::Docker;
 use dotenvy::dotenv;
 use std::env;
 
-#[cfg(feature = "s3_logging")]
 use aws_config::{self, BehaviorVersion};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{error, info}; 
+use tracing::{error, info, warn}; 
 use crate::queue::{RedisQueue, JobQueue};
-use crate::models::JobRegistry;
+use crate::models::{JobRegistry, StreamRegistry};
 use tokio::sync::RwLock;
 use std::collections::HashMap;
+use bollard::container::ListContainersOptions;
+use crate::db::sql_placeholder;
 
 const PORT: u16 = 3000;
 const MAX_CONCURRENT_JOBS: usize = 50;
@@ -27,9 +28,6 @@ const MAX_CONCURRENT_JOBS: usize = 50;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- CRITICAL FIX FOR RUSTLS 0.23 PANIC ---
-    // We must manually install the crypto provider at the very start of the process.
-    // This tells rustls to use 'ring' as the underlying crypto engine.
-    // We ignore the error in case something else (like a library) installed it first.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     dotenv().ok();
@@ -41,13 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::io::Error::new(std::io::ErrorKind::Other, "Missing ZORP_SECRET_KEY")
         })?;
 
-    info!(":: Zorp v0.1.0 (Hybrid Edition) ::");
+    info!(":: Zorp v0.1.0 (Production Edition) ::");
     
-    // 1. Initialize DB (Auto-detects based on feature)
+    // 1. Initialize DB
     let db_pool = db::init_pool().await?;
 
     // 2. Initialize Redis Queue
-    // Now supports "rediss://" schemes for TLS connections automatically!
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     
     if redis_url.starts_with("rediss://") {
@@ -62,8 +59,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Initialize Docker
     let docker = Docker::connect_with_local_defaults()?;
 
-    // 3b. Initialize JobRegistry
+    // 3b. Initialize JobRegistry & StreamRegistry
+    info!("🔄 Performing State Reconciliation...");
     let job_registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let stream_registry: StreamRegistry = Arc::new(RwLock::new(HashMap::new()));
+    
+    let mut filters = HashMap::new();
+    filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
+    
+    let options = ListContainersOptions {
+        all: true,
+        filters,
+        ..Default::default()
+    };
+    
+    if let Ok(containers) = docker.list_containers(Some(options)).await {
+        let mut reg = job_registry.write().await;
+        for c in containers {
+            // Only care about running containers to populate registry
+            if c.state.as_deref() == Some("running") {
+                if let (Some(id), Some(labels)) = (c.id, c.labels) {
+                     if let Some(job_id) = labels.get("job_id") {
+                         // Verify with DB
+                         let query = format!("SELECT status FROM jobs WHERE id = {}", sql_placeholder(1));
+                         if let Ok(Some((status,))) = sqlx::query_as::<_, (String,)>(&query)
+                            .bind(job_id)
+                            .fetch_optional(&db_pool).await 
+                         {
+                             if status == "RUNNING" {
+                                 info!("   - Re-attached job: {} (Container: {})", job_id, id);
+                                 reg.insert(job_id.clone(), id.clone());
+                                 // Note: We cannot re-attach log stream easily for recovered jobs 
+                                 // without implementing `docker attach` logic again, which is complex.
+                                 // For now, recovered jobs won't support live streaming, only file logging.
+                             } else {
+                                 warn!("   - Zombie container found (Job {} is {}). Will be reaped.", job_id, status);
+                             }
+                         }
+                     }
+                }
+            }
+        }
+    }
+    info!("✅ State Reconciliation Complete. Active Jobs: {}", job_registry.read().await.len());
 
     // 4. Run Zombie Reaper (Background Task)
     engine::spawn_reaper_task(docker.clone(), db_pool.clone());
@@ -73,30 +111,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
     
-    #[cfg(feature = "s3_logging")]
-    let (s3_client, s3_bucket) = {
-        let mut client = None;
-        let mut bucket = None;
+    // Mandatory S3 Configuration
+    let s3_bucket = env::var("S3_BUCKET_NAME").map_err(|_| {
+        error!("❌ S3_BUCKET_NAME is mandatory in Production Mode.");
+        std::io::Error::new(std::io::ErrorKind::Other, "Missing S3_BUCKET_NAME")
+    })?;
 
-        if let Ok(val) = env::var("ENABLE_S3_LOGGING") {
-            if val.parse().unwrap_or(false) {
-                info!("S3 logging is enabled. Configuring S3 client...");
-                let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-                let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
+    info!("Configuring S3 client...");
+    let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
 
-                if let Ok(endpoint) = env::var("S3_ENDPOINT_URL") {
-                    s3_config_builder = s3_config_builder.endpoint_url(endpoint);
-                }
-                if let Ok(force_path) = env::var("S3_FORCE_PATH_STYLE") {
-                        s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
-                }
-                
-                client = Some(aws_sdk_s3::Client::from_conf(s3_config_builder.build()));
-                bucket = env::var("S3_BUCKET_NAME").ok();
-            }
-        }
-        (client, bucket)
-    };
+    if let Ok(endpoint) = env::var("S3_ENDPOINT_URL") {
+        s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+    }
+    if let Ok(force_path) = env::var("S3_FORCE_PATH_STYLE") {
+            s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
+    }
+    
+    let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
     
     let dispatcher = Arc::new(engine::Dispatcher::new(
         docker.clone(),
@@ -104,30 +136,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client,
         MAX_CONCURRENT_JOBS,
         job_registry.clone(),
-        #[cfg(feature = "s3_logging")]
+        stream_registry.clone(),
         s3_client.clone(),
-        #[cfg(feature = "s3_logging")]
         s3_bucket.clone(),
+        secret_key.clone(),
     ));
 
-    // 6. Spawn WORKER THREAD
+    // 6. Spawn WORKER THREAD (with Graceful Shutdown support)
     let queue_for_worker = queue.clone();
     let dispatcher_for_worker = dispatcher.clone();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
     
+    let worker_shutdown_rx = shutdown_tx.subscribe();
+
     tokio::spawn(async move {
-        info!("👷 Worker thread started. Listening for jobs from Redis...");
+        info!("👷 Worker thread started.");
+        let mut shutdown = worker_shutdown_rx;
         loop {
-            match queue_for_worker.dequeue().await {
-                Ok(Some(job)) => {
-                    info!("📥 Worker picked up job: {}", job.id);
-                    dispatcher_for_worker.dispatch(job).await; 
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    info!("👷 Worker thread stopping...");
+                    break;
                 }
-                Ok(None) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                Err(e) => {
-                    error!("❌ Queue Error: {}. Retrying in 5s...", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                job = queue_for_worker.dequeue() => {
+                    match job {
+                        Ok(Some(job)) => {
+                            info!("📥 Worker picked up job: {}", job.id);
+                            dispatcher_for_worker.dispatch(job).await; 
+                        }
+                        Ok(None) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        Err(e) => {
+                            error!("❌ Queue Error: {}. Retrying in 5s...", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }
                 }
             }
         }
@@ -135,24 +179,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Setup App State
     let state = Arc::new(api::AppState {
-        db: db_pool,
+        db: db_pool.clone(),
         queue: queue,
         secret_key,
         docker: docker,
         job_registry: job_registry,
-        #[cfg(feature = "s3_logging")]
-        s3_client,
-        #[cfg(feature = "s3_logging")]
-        s3_bucket,
+        stream_registry: stream_registry,
+        s3_client: Some(s3_client),
+        s3_bucket: Some(s3_bucket),
     });
 
-    // 8. Start Server
+    // 8. Start Server with Graceful Shutdown
     let app = api::create_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], PORT));
     info!("Server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    
+    // Axum 0.7 graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let ctrl_c = async {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to install Ctrl+C handler");
+            };
 
+            #[cfg(unix)]
+            let terminate = async {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install signal handler")
+                    .recv()
+                    .await;
+            };
+
+            #[cfg(not(unix))]
+            let terminate = std::future::pending::<()>();
+
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = terminate => {},
+            }
+
+            info!("🛑 Shutdown signal received.");
+            let _ = shutdown_tx.send(());
+        })
+        .await
+        .unwrap();
+
+    info!("👋 Zorp shutdown complete.");
     Ok(())
 }
