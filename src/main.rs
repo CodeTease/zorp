@@ -115,6 +115,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Run Zombie Reaper (Background Task)
     engine::spawn_reaper_task(docker.clone(), db_pool.clone());
 
+    // 4b. Run Queue Monitor (Background Task) - Heartbeat & Auto-Recovery
+    let queue_monitor = queue.clone();
+    tokio::spawn(async move {
+        info!("❤️  Queue Monitor (Heartbeat & Auto-Recovery) started.");
+        loop {
+            // Monitor stranded jobs every 30s
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Err(e) = queue_monitor.monitor_stranded_jobs().await {
+                error!("❌ Queue Monitor Error: {}", e);
+            }
+        }
+    });
+
     // 5. Initialize Engine (Dispatcher)
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

@@ -11,6 +11,8 @@ pub trait JobQueue: Send + Sync {
     async fn dequeue(&self) -> Result<Option<JobContext>, Box<dyn std::error::Error + Send + Sync>>;
     async fn acknowledge(&self, job: &JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn restore_stranded(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
+    async fn update_heartbeat(&self, job_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn monitor_stranded_jobs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // --- REDIS IMPLEMENTATION ---
@@ -60,6 +62,12 @@ impl JobQueue for RedisQueue {
             Some(payload_str) => {
                 let job: JobContext = serde_json::from_str(&payload_str)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                
+                // Set initial heartbeat immediately to prevent race with monitor
+                let key = format!("zorp:heartbeat:{}", job.id);
+                let _: () = conn.set_ex(key, "1", 30).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
                 Ok(Some(job))
             }
             None => Ok(None),
@@ -107,5 +115,63 @@ impl JobQueue for RedisQueue {
         }
         
         Ok(count)
+    }
+
+    async fn update_heartbeat(&self, job_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let key = format!("zorp:heartbeat:{}", job_id);
+        // Set heartbeat with 30s expiration
+        let _: () = conn.set_ex(key, "1", 30).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        Ok(())
+    }
+
+    async fn monitor_stranded_jobs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // Get all processing jobs
+        let jobs: Vec<String> = conn.lrange(&self.processing_queue_name, 0, -1).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let mut restored_count = 0;
+
+        for payload in jobs {
+            let job: JobContext = match serde_json::from_str(&payload) {
+                Ok(j) => j,
+                Err(e) => {
+                    warn!("Failed to parse job in processing queue: {}. Skipping.", e);
+                    continue;
+                }
+            };
+
+            let key = format!("zorp:heartbeat:{}", job.id);
+            let exists: bool = conn.exists(&key).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+            if !exists {
+                info!("Heartbeat missing for job {}. Restoring to queue.", job.id);
+                
+                // Transactional move: Remove from processing and push to queue
+                // LREM removes matching 'payload'.
+                let removed: i64 = conn.lrem(&self.processing_queue_name, 1, &payload).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                if removed > 0 {
+                    let _: () = conn.lpush(&self.queue_name, &payload).await
+                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    restored_count += 1;
+                }
+            }
+        }
+        
+        if restored_count > 0 {
+            info!("Monitor: Restored {} stranded jobs.", restored_count);
+        }
+
+        Ok(restored_count)
     }
 }

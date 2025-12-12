@@ -255,6 +255,19 @@ impl Dispatcher {
             info!("[{}] Status: RUNNING", job.id);
             let _ = tx.send(format!("INFO: Job {} started.\n", job.id));
 
+            // Start Heartbeat Loop
+            let queue_for_heartbeat = queue.clone();
+            let job_id_for_heartbeat = job.id.clone();
+            // We use a cancellation token or just abort handle for the heartbeat task
+            let heartbeat_handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    if let Err(e) = queue_for_heartbeat.update_heartbeat(&job_id_for_heartbeat).await {
+                         warn!("[{}] Failed to update heartbeat: {}", job_id_for_heartbeat, e);
+                    }
+                }
+            });
+
             let mut final_status = "FINISHED";
             let mut final_exit_code = 0;
             // captured_logs is now replaced by file streaming, but we keep a variable for webhook/db fallback
@@ -529,6 +542,9 @@ impl Dispatcher {
             info!("[{}] Status: {} (Exit: {}). Time: {:.2}s", job.id, final_status, final_exit_code, duration);
 
             // Acknowledge the job in the queue (Remove from processing queue)
+            // Stop heartbeat
+            heartbeat_handle.abort();
+
             if let Err(e) = queue.acknowledge(&job).await {
                 error!("[{}] Failed to acknowledge job in queue: {}", job.id, e);
             } else {
