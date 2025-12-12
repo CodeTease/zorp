@@ -14,11 +14,13 @@ use serde::{Deserialize};
 use uuid::Uuid;
 use tracing::{error, info, warn};
 use bollard::Docker;
-use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, StreamRegistry};
+use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry};
 use crate::queue::JobQueue;
 use crate::db::{DbPool, sql_placeholder};
 use crate::engine;
 use crate::metrics;
+use crate::streaming::RedisLogPublisher;
+use futures_util::StreamExt;
 
 use aws_sdk_s3;
 use axum::body::Body;
@@ -31,7 +33,6 @@ pub struct AppState {
     pub secret_key: String,
     pub docker: Docker,
     pub job_registry: JobRegistry,
-    pub stream_registry: StreamRegistry,
     pub s3_client: Option<aws_sdk_s3::Client>,
     pub s3_bucket: Option<String>,
 }
@@ -252,24 +253,22 @@ async fn handle_stream_logs(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     info!("Client connected to stream logs for job: {}", job_id);
 
-    // Try to get broadcast receiver from registry
-    let rx = {
-        let registry = state.stream_registry.read().await;
-        registry.get(&job_id).map(|tx| tx.subscribe())
-    };
+    // Redis Subscriber
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let publisher = RedisLogPublisher::new(&redis_url);
 
     let stream = async_stream::stream! {
-        if let Some(mut rx) = rx {
-            // Job is running, stream live logs
-            while let Ok(msg) = rx.recv().await {
-                yield Ok(Event::default().data(msg));
+        match publisher.subscribe(&job_id).await {
+            Ok(mut rx) => {
+                 while let Some(msg) = rx.next().await {
+                     yield Ok(Event::default().data(msg));
+                 }
+                 yield Ok(Event::default().data("[Stream Ended: Redis Connection Closed]"));
+            },
+            Err(e) => {
+                error!("Failed to subscribe to redis log channel for {}: {}", job_id, e);
+                yield Ok(Event::default().data("[Error: Failed to connect to log stream]"));
             }
-            yield Ok(Event::default().data("[Stream Ended: Job Finished]"));
-        } else {
-            // Job not running or not found.
-            // Check if it's finished by querying DB?
-            // For now just say it's not live.
-            yield Ok(Event::default().data("[Error: Job is not running or live stream unavailable. Check /logs endpoint.]"));
         }
     };
 

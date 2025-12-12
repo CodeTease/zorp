@@ -7,6 +7,7 @@ mod engine;
 mod models;
 mod queue;
 mod metrics; // Added metrics module
+mod streaming; // Added streaming module
 
 use bollard::Docker;
 use dotenvy::dotenv;
@@ -17,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info, warn}; 
 use crate::queue::{RedisQueue, JobQueue};
-use crate::models::{JobRegistry, StreamRegistry};
+use crate::models::{JobRegistry};
 use tokio::sync::RwLock;
 use std::collections::HashMap;
 use bollard::container::ListContainersOptions;
@@ -68,10 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Initialize Docker
     let docker = Docker::connect_with_local_defaults()?;
 
-    // 3b. Initialize JobRegistry & StreamRegistry
+    // 3b. Initialize JobRegistry
     info!("🔄 Performing State Reconciliation...");
     let job_registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
-    let stream_registry: StreamRegistry = Arc::new(RwLock::new(HashMap::new()));
     
     let mut filters = HashMap::new();
     filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
@@ -158,7 +158,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client,
         MAX_CONCURRENT_JOBS,
         job_registry.clone(),
-        stream_registry.clone(),
         s3_client.clone(),
         s3_bucket.clone(),
         secret_key.clone(),
@@ -207,7 +206,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret_key,
         docker: docker,
         job_registry: job_registry,
-        stream_registry: stream_registry,
         s3_client: Some(s3_client),
         s3_bucket: Some(s3_bucket),
     });

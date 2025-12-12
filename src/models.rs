@@ -8,10 +8,6 @@ use tokio::sync::broadcast;
 
 pub type JobRegistry = Arc<RwLock<HashMap<String, String>>>;
 
-// Stream Registry: Map<JobId, BroadcastSender<String>>
-// Used for real-time log streaming
-pub type StreamRegistry = Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>;
-
 #[derive(Debug, Deserialize, Clone, Serialize)] // ADDED Serialize here for API response
 pub struct JobLimits {
     pub memory_mb: Option<i64>,
