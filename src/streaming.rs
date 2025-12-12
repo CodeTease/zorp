@@ -1,5 +1,4 @@
 use redis::AsyncCommands;
-use tracing::error;
 use futures_util::StreamExt;
 
 pub struct RedisLogPublisher {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use sqlx::Row;
 use serde::{Deserialize};
 use uuid::Uuid;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use bollard::Docker;
 use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, ApiKey};
 use crate::queue::JobQueue;
@@ -301,7 +301,7 @@ async fn handle_get_job_logs(
 
 // --- SSE LOG STREAMING ---
 async fn handle_stream_logs(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>, // Added underscore
     Path(job_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     info!("Client connected to stream logs for job: {}", job_id);

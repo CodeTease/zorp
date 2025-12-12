@@ -1,5 +1,5 @@
 use std::env;
-use tracing::{info, warn};
+use tracing::info;
 
 // --- CONDITIONAL TYPE ALIASING ---
 // Priority: Postgres > Sqlite
@@ -48,7 +48,8 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
 
         // Run migrations
         info!("Running PostgreSQL migrations...");
-        sqlx::migrate!("./migrations/postgres").run(&pool).await?;
+        // Use relative path without ./ prefix to avoid canonicalization issues on some systems
+        sqlx::migrate!("migrations/postgres").run(&pool).await?;
 
         return Ok(pool);
     }
@@ -58,6 +59,7 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
     {
         use sqlx::{migrate::MigrateDatabase, sqlite::{SqlitePoolOptions, SqliteConnectOptions}, Sqlite};
         use std::str::FromStr;
+        use tracing::warn;
 
         // Warning for Production
         warn!("⚠️  WARNING: Running in SQLite mode. This is NOT recommended for production CI/CD workloads.");
@@ -93,7 +95,7 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
 
         // Run migrations
         info!("Running SQLite migrations...");
-        sqlx::migrate!("./migrations/sqlite").run(&pool).await?;
+        sqlx::migrate!("migrations/sqlite").run(&pool).await?;
 
         return Ok(pool);
     }

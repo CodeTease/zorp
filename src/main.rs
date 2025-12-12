@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Spawn WORKER THREAD (with Graceful Shutdown support)
     let queue_for_worker = queue.clone();
     let dispatcher_for_worker = dispatcher.clone();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let (shutdown_tx, mut _shutdown_rx) = tokio::sync::broadcast::channel(1); // Fixed unused warning
     
     let worker_shutdown_rx = shutdown_tx.subscribe();
 
