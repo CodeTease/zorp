@@ -48,8 +48,8 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
 
         // Run migrations
         info!("Running PostgreSQL migrations...");
-        // Use relative path without ./ prefix to avoid canonicalization issues on some systems
-        sqlx::migrate!("migrations/postgres").run(&pool).await?;
+        let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations/postgres")).await?;
+        migrator.run(&pool).await?;
 
         return Ok(pool);
     }
@@ -95,7 +95,8 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
 
         // Run migrations
         info!("Running SQLite migrations...");
-        sqlx::migrate!("migrations/sqlite").run(&pool).await?;
+        let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations/sqlite")).await?;
+        migrator.run(&pool).await?;
 
         return Ok(pool);
     }
