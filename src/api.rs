@@ -14,13 +14,14 @@ use serde::{Deserialize};
 use uuid::Uuid;
 use tracing::{error, info, warn};
 use bollard::Docker;
-use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry};
+use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, ApiKey};
 use crate::queue::JobQueue;
 use crate::db::{DbPool, sql_placeholder};
 use crate::engine;
 use crate::metrics;
 use crate::streaming::RedisLogPublisher;
 use futures_util::StreamExt;
+use sha2::{Sha256, Digest};
 
 use aws_sdk_s3;
 use axum::body::Body;
@@ -37,8 +38,16 @@ pub struct AppState {
     pub s3_bucket: Option<String>,
 }
 
+// --- AUTH CONTEXT ---
+#[derive(Clone, Debug)]
+pub struct AuthContext {
+    pub user_id: Option<String>,
+    pub permissions: Vec<String>,
+    pub role: String, // e.g. "admin", "viewer", "system"
+}
+
 // --- AUTH MIDDLEWARE ---
-struct Auth;
+struct Auth(AuthContext);
 
 #[async_trait]
 impl FromRequestParts<Arc<AppState>> for Auth {
@@ -47,8 +56,38 @@ impl FromRequestParts<Arc<AppState>> for Auth {
         if let Some(auth_header) = parts.headers.get(header::AUTHORIZATION) {
             if let Ok(auth_str) = auth_header.to_str() {
                 if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                    // 1. Check Legacy/Root Key
                     if token == state.secret_key {
-                        return Ok(Self);
+                        return Ok(Auth(AuthContext {
+                            user_id: None,
+                            permissions: vec!["*".to_string()],
+                            role: "admin".to_string(),
+                        }));
+                    }
+
+                    // 2. Check Database API Keys (Hashed)
+                    let mut hasher = Sha256::new();
+                    hasher.update(token.as_bytes());
+                    let result = hasher.finalize();
+                    let key_hash = hex::encode(result);
+
+                    // Dynamic SQL: SELECT * FROM api_keys WHERE key_hash = $1
+                    let query = format!("SELECT * FROM api_keys WHERE key_hash = {}", sql_placeholder(1));
+                    
+                    if let Ok(Some(api_key)) = sqlx::query_as::<_, ApiKey>(&query)
+                        .bind(key_hash)
+                        .fetch_optional(&state.db).await 
+                    {
+                        // Parse permissions
+                        let permissions = api_key.permissions
+                            .map(|p| p.split(',').map(|s| s.trim().to_string()).collect())
+                            .unwrap_or_default();
+
+                        return Ok(Auth(AuthContext {
+                            user_id: Some(api_key.user_id),
+                            permissions,
+                            role: "user".to_string(), // In future, fetch user role
+                        }));
                     }
                 }
             }
@@ -77,19 +116,27 @@ async fn handle_metrics() -> String {
 
 async fn handle_dispatch(
     State(state): State<Arc<AppState>>,
-    _: Auth,
+    Auth(auth): Auth,
     Json(payload): Json<JobRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // RBAC Check
+    if auth.role != "admin" && !auth.permissions.contains(&"dispatch".to_string()) && !auth.permissions.contains(&"*".to_string()) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Insufficient permissions"})));
+    }
+
     let job_id = Uuid::new_v4().to_string();
+    let user_id = auth.user_id.or(payload.user.clone()); // Prefer Auth user_id, fallback to payload user if allowed (or none)
     
     // 1. Persist to DB first (Status: QUEUED)
-    // Dynamic SQL: INSERT INTO jobs (...) VALUES ($1, 'QUEUED', $2, $3, $4)
+    // Dynamic SQL: INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES ($1, 'QUEUED', $2, $3, $4, $5)
+    // Note: user_id needs to be added to DB via migration first.
     let query = format!(
-        "INSERT INTO jobs (id, status, image, commands, callback_url) VALUES ({}, 'QUEUED', {}, {}, {})",
+        "INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES ({}, 'QUEUED', {}, {}, {}, {})",
         sql_placeholder(1), // id
         sql_placeholder(2), // image
         sql_placeholder(3), // commands
-        sql_placeholder(4)  // callback_url
+        sql_placeholder(4), // callback_url
+        sql_placeholder(5)  // user_id
     );
 
     let insert_result = sqlx::query(&query)
@@ -97,6 +144,7 @@ async fn handle_dispatch(
     .bind(&payload.image)
     .bind(serde_json::to_string(&payload.commands).unwrap_or_default())
     .bind(&payload.callback_url)
+    .bind(&user_id)
     .execute(&state.db).await;
 
     match insert_result {
@@ -110,7 +158,7 @@ async fn handle_dispatch(
                 callback_url: payload.callback_url,
                 timeout_seconds: payload.timeout_seconds,
                 artifacts_path: payload.artifacts_path,
-                user: payload.user,
+                user: user_id,
             };
 
             // 2. Push to Redis Queue
@@ -152,9 +200,14 @@ async fn handle_dispatch(
 
 async fn handle_cancel_job(
     State(state): State<Arc<AppState>>,
-    _: Auth,
+    Auth(auth): Auth,
     Path(job_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // RBAC Check
+    if auth.role != "admin" && !auth.permissions.contains(&"cancel".to_string()) && !auth.permissions.contains(&"*".to_string()) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Insufficient permissions"})));
+    }
+
     match engine::cancel_job(&state.docker, &state.job_registry, &job_id, &state.db).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({
             "status": "cancelled",
@@ -175,7 +228,7 @@ async fn handle_get_job(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Dynamic SQL: SELECT ... FROM jobs WHERE id = $1
     let query = format!(
-        "SELECT id, status, exit_code, image, created_at FROM jobs WHERE id = {}",
+        "SELECT id, status, exit_code, image, created_at, user_id FROM jobs WHERE id = {}",
         sql_placeholder(1)
     );
 
@@ -293,7 +346,7 @@ async fn handle_list_jobs(
     #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     type BuildDb = sqlx::Sqlite;
 
-    let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at FROM jobs");
+    let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at, user_id FROM jobs");
 
     if let Some(status) = query.status {
         q_builder.push(" WHERE status = ");

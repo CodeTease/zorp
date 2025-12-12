@@ -333,8 +333,27 @@ impl Dispatcher {
                     config
                 ).await {
                     Ok(_) => {
-                        if let Err(e) = docker.start_container(&container_name, None::<StartContainerOptions<String>>).await {
-                             error!("[{}] Start failed: {}", job.id, e);
+                        // --- RETRY LOGIC START ---
+                        let mut start_attempts = 0;
+                        let max_retries = 3;
+                        let mut start_result = Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 500,
+                            message: "Initial attempt".to_string(),
+                        }); // Dummy error to init
+
+                        while start_attempts < max_retries {
+                             start_result = docker.start_container(&container_name, None::<StartContainerOptions<String>>).await;
+                             if start_result.is_ok() {
+                                 break;
+                             }
+                             start_attempts += 1;
+                             warn!("[{}] Start failed (Attempt {}/{}): {:?}", job.id, start_attempts, max_retries, start_result.as_ref().err());
+                             tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(start_attempts as u32))).await;
+                        }
+                        // --- RETRY LOGIC END ---
+
+                        if let Err(e) = start_result {
+                             error!("[{}] Start failed after retries: {}", job.id, e);
                              let _ = log_publisher.publish(&job.id, &format!("ERROR: Container start failed: {}\n", e)).await;
                              final_status = "FAILED";
                              final_exit_code = -2;

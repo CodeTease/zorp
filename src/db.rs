@@ -46,25 +46,9 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
             .acquire_timeout(Duration::from_secs(30)) 
             .connect_with(connect_options).await?;
 
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                exit_code INTEGER,
-                image TEXT NOT NULL,
-                commands TEXT NOT NULL,
-                logs TEXT,
-                callback_url TEXT,
-                artifact_url TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            "#
-        )
-        .execute(&pool).await?;
-
-        // Simple migration
-        let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN artifact_url TEXT").execute(&pool).await;
+        // Run migrations
+        info!("Running PostgreSQL migrations...");
+        sqlx::migrate!("./migrations/postgres").run(&pool).await?;
 
         return Ok(pool);
     }
@@ -107,25 +91,9 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
             .max_connections(50) 
             .connect_with(options).await?;
 
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                exit_code INTEGER,
-                image TEXT NOT NULL,
-                commands TEXT NOT NULL,
-                logs TEXT,
-                callback_url TEXT,
-                artifact_url TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            "#
-        )
-        .execute(&pool).await?;
-
-        // Simple migration
-        let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN artifact_url TEXT").execute(&pool).await;
+        // Run migrations
+        info!("Running SQLite migrations...");
+        sqlx::migrate!("./migrations/sqlite").run(&pool).await?;
 
         return Ok(pool);
     }

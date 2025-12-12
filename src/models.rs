@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use chrono::{DateTime, Utc};
 
 // --- DATA STRUCTURES ---
 
@@ -32,8 +33,9 @@ pub struct JobStatus {
     pub status: String,
     pub exit_code: Option<i32>,
     pub image: String,
-    pub created_at: String,
+    pub created_at: DateTime<Utc>, // Changed to DateTime<Utc>
     pub artifact_url: Option<String>,
+    pub user_id: Option<String>,
 }
 
 // FIX: Added Serialize and Deserialize so Redis can store/retrieve this struct
@@ -48,4 +50,26 @@ pub struct JobContext {
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
     pub user: Option<String>, // New field for configurable user
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    #[serde(skip)]
+    pub password_hash: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ApiKey {
+    pub id: String,
+    pub user_id: String,
+    #[serde(skip)]
+    pub key_hash: String,
+    pub label: Option<String>,
+    pub permissions: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
 }
