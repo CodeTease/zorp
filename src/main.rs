@@ -42,8 +42,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(":: Zorp v0.1.0 (Production Edition) ::");
     
-    // 1. Initialize DB
-    let db_pool = db::init_pool().await?;
+    // 1. Initialize DB (with Retry)
+    let mut db_retry_attempts = 0;
+    let db_pool = loop {
+        match db::init_pool().await {
+            Ok(pool) => break pool,
+            Err(e) => {
+                db_retry_attempts += 1;
+                if db_retry_attempts > 5 {
+                    error!("❌ Failed to connect to DB after 5 attempts. Exiting.");
+                    return Err(e);
+                }
+                warn!("⚠️  DB Connection failed: {}. Retrying in 5s... ({}/5)", e, db_retry_attempts);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    };
+    info!("✅ Database connected successfully.");
 
     // 2. Initialize Redis Queue
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -112,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✅ State Reconciliation Complete. Active Jobs: {}", job_registry.read().await.len());
 
     // 4. Run Zombie Reaper (Background Task)
-    engine::spawn_reaper_task(docker.clone(), db_pool.clone());
+    engine::spawn_reaper_task(docker.clone(), db_pool.clone(), job_registry.clone());
 
     // 4b. Run Queue Monitor (Background Task) - Heartbeat & Auto-Recovery
     let queue_monitor = queue.clone();

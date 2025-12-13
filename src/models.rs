@@ -49,6 +49,8 @@ pub struct JobContext {
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
     pub user: Option<String>, // New field for configurable user
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

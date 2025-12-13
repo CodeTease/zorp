@@ -75,7 +75,7 @@ pub async fn cancel_job(
 }
 
 // --- THE ZOMBIE REAPER & GARBAGE COLLECTOR ---
-pub fn spawn_reaper_task(docker: Docker, db: DbPool) {
+pub fn spawn_reaper_task(docker: Docker, db: DbPool, registry: JobRegistry) {
     tokio::spawn(async move {
         info!("逐 Zombie Reaper & Garbage Collector task started.");
         loop {
@@ -83,7 +83,7 @@ pub fn spawn_reaper_task(docker: Docker, db: DbPool) {
             reap_zombies(&docker, &db).await;
             
             // Garbage Collection (Temp files & Pruning)
-            garbage_collection(&docker).await;
+            garbage_collection(&docker, &registry).await;
 
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
@@ -134,7 +134,7 @@ async fn reap_zombies(docker: &Docker, db: &DbPool) {
     }
 }
 
-async fn garbage_collection(docker: &Docker) {
+async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
     // 1. Clean up stale /tmp files (logs & artifacts) older than 1 hour
     let tmp_dir = std::path::Path::new("/tmp");
     if let Ok(mut entries) = tokio::fs::read_dir(tmp_dir).await {
@@ -142,6 +142,19 @@ async fn garbage_collection(docker: &Docker) {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.starts_with("zorp-") {
+                    // Extract ID from zorp-{id}.log or zorp-artifacts-{id}.tar
+                    let job_id = if name.starts_with("zorp-artifacts-") {
+                        name.trim_start_matches("zorp-artifacts-").trim_end_matches(".tar")
+                    } else {
+                        name.trim_start_matches("zorp-").trim_end_matches(".log")
+                    };
+
+                    // Check if job is still running
+                    if registry.read().await.contains_key(job_id) {
+                         // Job is running, SKIP deletion even if old (long running job)
+                         continue;
+                    }
+
                     if let Ok(metadata) = entry.metadata().await {
                         if let Ok(modified) = metadata.modified() {
                             if let Ok(age) = SystemTime::now().duration_since(modified) {
@@ -272,13 +285,19 @@ impl Dispatcher {
                 map.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
             });
 
+            // Resource Limits (Hard Limits or Defaults)
+            let default_mem_mb = std::env::var("ZORP_DEFAULT_MEMORY_MB")
+                .ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(256);
+            let default_cpu_cores = std::env::var("ZORP_DEFAULT_CPU_CORES")
+                .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+
             let memory = job.limits.as_ref()
                 .and_then(|l| l.memory_mb)
-                .map(|mb| mb * 1024 * 1024);
+                .unwrap_or(default_mem_mb) * 1024 * 1024;
             
-            let cpu_quota = job.limits.as_ref()
+            let cpu_quota = (job.limits.as_ref()
                 .and_then(|l| l.cpu_cores)
-                .map(|cores| (cores * 100000.0) as i64);
+                .unwrap_or(default_cpu_cores) * 100000.0) as i64;
 
             // Ensure Network Exists
             if let Err(_) = docker.inspect_network::<String>(ZORP_NETWORK_NAME, None).await {
@@ -308,8 +327,8 @@ impl Dispatcher {
                     labels: Some(labels),
                     host_config: Some(HostConfig {
                         auto_remove: Some(false), 
-                        memory: memory.or(Some(1024 * 1024 * 512)), 
-                        cpu_quota: cpu_quota.or(Some(100000)),
+                        memory: Some(memory), 
+                        cpu_quota: Some(cpu_quota),
                         // Security Context
                         readonly_rootfs: Some(true),
                         cap_drop: Some(vec!["ALL".to_string()]),

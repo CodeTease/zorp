@@ -99,15 +99,42 @@ impl JobQueue for RedisQueue {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             
         let mut count = 0;
+        let dlq_name = format!("{}:dlq", self.queue_name);
+
         loop {
-            // RPOPLPUSH from processing back to queue.
-            // Returns the element being popped. If None, list is empty.
-            let item: Option<String> = conn.rpoplpush(&self.processing_queue_name, &self.queue_name).await
+            // 1. Pop from processing queue (simulating RPOPLPUSH but with inspection)
+            // Note: redis::AsyncCommands::rpop takes 2 args in 0.32 (key, count)
+            let item: Option<String> = conn.rpop(&self.processing_queue_name, None).await
                  .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            
+
             match item {
-                Some(_) => count += 1,
-                None => break,
+                Some(payload) => {
+                    let mut job: JobContext = match serde_json::from_str(&payload) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            warn!("Poison Pill found! Failed to parse stranded job: {}. Moving to DLQ.", e);
+                            let _: () = conn.lpush(&dlq_name, &payload).await
+                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                            continue;
+                        }
+                    };
+
+                    job.retry_count += 1;
+                    
+                    if job.retry_count > 3 {
+                         warn!("Job {} exceeded max retries ({}). Moving to DLQ.", job.id, job.retry_count);
+                         let new_payload = serde_json::to_string(&job).unwrap();
+                         let _: () = conn.lpush(&dlq_name, new_payload).await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    } else {
+                         let new_payload = serde_json::to_string(&job).unwrap();
+                         // Push back to main queue
+                         let _: () = conn.lpush(&self.queue_name, new_payload).await
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                         count += 1;
+                    }
+                },
+                None => break, // List is empty
             }
         }
         

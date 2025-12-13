@@ -185,6 +185,7 @@ async fn handle_dispatch(
                 timeout_seconds: payload.timeout_seconds,
                 artifacts_path: payload.artifacts_path,
                 user: user_id,
+                retry_count: 0,
             };
 
             // 2. Push to Redis Queue
