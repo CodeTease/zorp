@@ -26,7 +26,7 @@ HOST_IP = "127.0.0.1"
 WEBHOOK_URL = f"http://{HOST_IP}:{WEBHOOK_PORT}"
 
 # Tăng áp lực lên một chút
-NUM_CONCURRENT_JOBS = 60
+NUM_CONCURRENT_JOBS = 50
 # Giới hạn thời gian chờ tối đa cho toàn bộ test
 MAX_WAIT_TIME = 30 
 

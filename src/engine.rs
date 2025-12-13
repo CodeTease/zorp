@@ -13,13 +13,13 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tokio::sync::Semaphore;
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::io::AsyncWriteExt; // Removed AsyncReadExt
 use tracing::{info, warn, error};
-use crate::models::{JobContext, JobRegistry, StreamRegistry};
+use crate::models::{JobContext, JobRegistry};
 use crate::db::{DbPool, sql_placeholder};
 use crate::queue::JobQueue;
 use crate::metrics;
-use tokio::sync::broadcast;
+use crate::streaming::RedisLogPublisher;
 use bollard::network::CreateNetworkOptions;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -75,7 +75,7 @@ pub async fn cancel_job(
 }
 
 // --- THE ZOMBIE REAPER & GARBAGE COLLECTOR ---
-pub fn spawn_reaper_task(docker: Docker, db: DbPool) {
+pub fn spawn_reaper_task(docker: Docker, db: DbPool, registry: JobRegistry) {
     tokio::spawn(async move {
         info!("逐 Zombie Reaper & Garbage Collector task started.");
         loop {
@@ -83,7 +83,7 @@ pub fn spawn_reaper_task(docker: Docker, db: DbPool) {
             reap_zombies(&docker, &db).await;
             
             // Garbage Collection (Temp files & Pruning)
-            garbage_collection(&docker).await;
+            garbage_collection(&docker, &registry).await;
 
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
@@ -134,7 +134,7 @@ async fn reap_zombies(docker: &Docker, db: &DbPool) {
     }
 }
 
-async fn garbage_collection(docker: &Docker) {
+async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
     // 1. Clean up stale /tmp files (logs & artifacts) older than 1 hour
     let tmp_dir = std::path::Path::new("/tmp");
     if let Ok(mut entries) = tokio::fs::read_dir(tmp_dir).await {
@@ -142,6 +142,19 @@ async fn garbage_collection(docker: &Docker) {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.starts_with("zorp-") {
+                    // Extract ID from zorp-{id}.log or zorp-artifacts-{id}.tar
+                    let job_id = if name.starts_with("zorp-artifacts-") {
+                        name.trim_start_matches("zorp-artifacts-").trim_end_matches(".tar")
+                    } else {
+                        name.trim_start_matches("zorp-").trim_end_matches(".log")
+                    };
+
+                    // Check if job is still running
+                    if registry.read().await.contains_key(job_id) {
+                         // Job is running, SKIP deletion even if old (long running job)
+                         continue;
+                    }
+
                     if let Ok(metadata) = entry.metadata().await {
                         if let Ok(modified) = metadata.modified() {
                             if let Ok(age) = SystemTime::now().duration_since(modified) {
@@ -179,7 +192,6 @@ pub struct Dispatcher {
     http_client: reqwest::Client,
     limiter: Arc<Semaphore>,
     job_registry: JobRegistry,
-    stream_registry: StreamRegistry,
     s3_client: Option<aws_sdk_s3::Client>,
     s3_bucket: Option<String>,
     secret_key: String,
@@ -193,7 +205,6 @@ impl Dispatcher {
         http_client: reqwest::Client, 
         max_concurrent: usize,
         job_registry: JobRegistry,
-        stream_registry: StreamRegistry,
         s3_client: aws_sdk_s3::Client,
         s3_bucket: String,
         secret_key: String,
@@ -205,7 +216,6 @@ impl Dispatcher {
             http_client,
             limiter: Arc::new(Semaphore::new(max_concurrent)),
             job_registry,
-            stream_registry,
             s3_client: Some(s3_client),
             s3_bucket: Some(s3_bucket),
             secret_key,
@@ -219,7 +229,6 @@ impl Dispatcher {
         let db = self.db.clone();
         let http_client = self.http_client.clone();
         let job_registry = self.job_registry.clone();
-        let stream_registry = self.stream_registry.clone();
         let s3_client = self.s3_client.clone();
         let s3_bucket = self.s3_bucket.clone();
         let secret_key = self.secret_key.clone();
@@ -232,18 +241,15 @@ impl Dispatcher {
 
             let start_time = Instant::now();
             let container_name = format!("zorp-{}", job.id);
+            
+            // Redis Publisher for logs
+            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            let log_publisher = RedisLogPublisher::new(&redis_url);
 
             // Register job for cancellation
             {
                 let mut reg = job_registry.write().await;
                 reg.insert(job.id.clone(), container_name.clone());
-            }
-
-            // Create broadcast channel for streaming logs
-            let (tx, _) = broadcast::channel(100);
-            {
-                let mut s_reg = stream_registry.write().await;
-                s_reg.insert(job.id.clone(), tx.clone());
             }
 
             // Dynamic SQL: UPDATE jobs SET status = 'RUNNING' WHERE id = $1
@@ -253,7 +259,20 @@ impl Dispatcher {
                 .execute(&db).await;
 
             info!("[{}] Status: RUNNING", job.id);
-            let _ = tx.send(format!("INFO: Job {} started.\n", job.id));
+            let _ = log_publisher.publish(&job.id, &format!("INFO: Job {} started.\n", job.id)).await;
+
+            // Start Heartbeat Loop
+            let queue_for_heartbeat = queue.clone();
+            let job_id_for_heartbeat = job.id.clone();
+            // We use a cancellation token or just abort handle for the heartbeat task
+            let heartbeat_handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    if let Err(e) = queue_for_heartbeat.update_heartbeat(&job_id_for_heartbeat).await {
+                         warn!("[{}] Failed to update heartbeat: {}", job_id_for_heartbeat, e);
+                    }
+                }
+            });
 
             let mut final_status = "FINISHED";
             let mut final_exit_code = 0;
@@ -266,13 +285,19 @@ impl Dispatcher {
                 map.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
             });
 
+            // Resource Limits (Hard Limits or Defaults)
+            let default_mem_mb = std::env::var("ZORP_DEFAULT_MEMORY_MB")
+                .ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(256);
+            let default_cpu_cores = std::env::var("ZORP_DEFAULT_CPU_CORES")
+                .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+
             let memory = job.limits.as_ref()
                 .and_then(|l| l.memory_mb)
-                .map(|mb| mb * 1024 * 1024);
+                .unwrap_or(default_mem_mb) * 1024 * 1024;
             
-            let cpu_quota = job.limits.as_ref()
+            let cpu_quota = (job.limits.as_ref()
                 .and_then(|l| l.cpu_cores)
-                .map(|cores| (cores * 100000.0) as i64);
+                .unwrap_or(default_cpu_cores) * 100000.0) as i64;
 
             // Ensure Network Exists
             if let Err(_) = docker.inspect_network::<String>(ZORP_NETWORK_NAME, None).await {
@@ -286,7 +311,7 @@ impl Dispatcher {
 
             if let Err(e) = ensure_image(&docker, &job.image).await {
                 error!("[{}] Image pull failed: {}", job.id, e);
-                let _ = tx.send(format!("ERROR: Image pull failed: {}\n", e));
+                let _ = log_publisher.publish(&job.id, &format!("ERROR: Image pull failed: {}\n", e)).await;
                 final_status = "FAILED";
                 final_exit_code = -1;
                 webhook_logs = format!("System Error: Image pull failed. {}", e);
@@ -302,8 +327,8 @@ impl Dispatcher {
                     labels: Some(labels),
                     host_config: Some(HostConfig {
                         auto_remove: Some(false), 
-                        memory: memory.or(Some(1024 * 1024 * 512)), 
-                        cpu_quota: cpu_quota.or(Some(100000)),
+                        memory: Some(memory), 
+                        cpu_quota: Some(cpu_quota),
                         // Security Context
                         readonly_rootfs: Some(true),
                         cap_drop: Some(vec!["ALL".to_string()]),
@@ -327,9 +352,28 @@ impl Dispatcher {
                     config
                 ).await {
                     Ok(_) => {
-                        if let Err(e) = docker.start_container(&container_name, None::<StartContainerOptions<String>>).await {
-                             error!("[{}] Start failed: {}", job.id, e);
-                             let _ = tx.send(format!("ERROR: Container start failed: {}\n", e));
+                        // --- RETRY LOGIC START ---
+                        let mut start_attempts = 0;
+                        let max_retries = 3;
+                        let mut start_result = Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 500,
+                            message: "Initial attempt".to_string(),
+                        }); // Dummy error to init
+
+                        while start_attempts < max_retries {
+                             start_result = docker.start_container(&container_name, None::<StartContainerOptions<String>>).await;
+                             if start_result.is_ok() {
+                                 break;
+                             }
+                             start_attempts += 1;
+                             warn!("[{}] Start failed (Attempt {}/{}): {:?}", job.id, start_attempts, max_retries, start_result.as_ref().err());
+                             tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(start_attempts as u32))).await;
+                        }
+                        // --- RETRY LOGIC END ---
+
+                        if let Err(e) = start_result {
+                             error!("[{}] Start failed after retries: {}", job.id, e);
+                             let _ = log_publisher.publish(&job.id, &format!("ERROR: Container start failed: {}\n", e)).await;
                              final_status = "FAILED";
                              final_exit_code = -2;
                              webhook_logs = format!("Error: Start failed: {}", e);
@@ -356,11 +400,11 @@ impl Dispatcher {
                                         Some(Ok(r)) => {
                                             final_exit_code = r.status_code as i32;
                                             info!("[{}] Container exited with {}", job.id, final_exit_code);
-                                            let _ = tx.send(format!("INFO: Container exited with code {}\n", final_exit_code));
+                                            let _ = log_publisher.publish(&job.id, &format!("INFO: Container exited with code {}\n", final_exit_code)).await;
                                         }
                                         Some(Err(e)) => {
                                             error!("[{}] Wait stream error: {}", job.id, e);
-                                            let _ = tx.send(format!("ERROR: Wait stream error: {}\n", e));
+                                            let _ = log_publisher.publish(&job.id, &format!("ERROR: Wait stream error: {}\n", e)).await;
                                             final_status = "FAILED";
                                             final_exit_code = -99;
                                         }
@@ -378,18 +422,18 @@ impl Dispatcher {
                                 _ = timeout_fut => {
                                     // Timeout
                                     info!("[{}] Timeout reached. Killing...", job.id);
-                                    let _ = tx.send("ERROR: Timeout reached. Killing container.\n".to_string());
+                                    let _ = log_publisher.publish(&job.id, "ERROR: Timeout reached. Killing container.\n").await;
                                     let _ = docker.kill_container::<String>(&container_name, None).await;
                                     final_status = "TIMED_OUT";
                                 }
                             }
 
                             // Collect logs to file (and stream)
-                            log_file_path = stream_logs_to_file_and_broadcast(&docker, &container_name, &job.id, &tx).await;
+                            log_file_path = stream_logs_to_file_and_broadcast(&docker, &container_name, &job.id, &log_publisher).await;
 
                             // Collect Artifacts
                             if let Some(art_path) = &job.artifacts_path {
-                                let _ = tx.send("INFO: Collecting artifacts...\n".to_string());
+                                let _ = log_publisher.publish(&job.id, "INFO: Collecting artifacts...\n").await;
                                 let options = Some(DownloadFromContainerOptions { path: art_path.clone() });
                                 let mut stream = docker.download_from_container(&container_name, options);
 
@@ -417,7 +461,7 @@ impl Dispatcher {
                                                      if let Ok(_) = s3.put_object().bucket(bucket).key(&key).body(bs).send().await {
                                                          final_artifact_url = format!("s3://{}/{}", bucket, key);
                                                          info!("[{}] Artifact uploaded: {}", job.id, final_artifact_url);
-                                                         let _ = tx.send(format!("INFO: Artifact uploaded to {}\n", final_artifact_url));
+                                                         let _ = log_publisher.publish(&job.id, &format!("INFO: Artifact uploaded to {}\n", final_artifact_url)).await;
                                                      }
                                                  },
                                                  Err(e) => error!("Failed to read artifact file: {}", e)
@@ -431,7 +475,7 @@ impl Dispatcher {
                     }
                     Err(e) => {
                          error!("[{}] Create failed: {}", job.id, e);
-                         let _ = tx.send(format!("ERROR: Create container failed: {}\n", e));
+                         let _ = log_publisher.publish(&job.id, &format!("ERROR: Create container failed: {}\n", e)).await;
                         final_status = "FAILED";
                         final_exit_code = -3;
                         webhook_logs = format!("Error: Container creation failed: {}", e);
@@ -445,11 +489,6 @@ impl Dispatcher {
             {
                 let mut reg = job_registry.write().await;
                 reg.remove(&job.id);
-            }
-            // Clean up stream registry
-            {
-                let mut s_reg = stream_registry.write().await;
-                s_reg.remove(&job.id);
             }
 
             if final_status != "TIMED_OUT" && final_status != "FAILED" && final_exit_code != 0 {
@@ -529,6 +568,9 @@ impl Dispatcher {
             info!("[{}] Status: {} (Exit: {}). Time: {:.2}s", job.id, final_status, final_exit_code, duration);
 
             // Acknowledge the job in the queue (Remove from processing queue)
+            // Stop heartbeat
+            heartbeat_handle.abort();
+
             if let Err(e) = queue.acknowledge(&job).await {
                 error!("[{}] Failed to acknowledge job in queue: {}", job.id, e);
             } else {
@@ -589,7 +631,7 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<(), bollard::error
     Ok(())
 }
 
-async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: &str, tx: &broadcast::Sender<String>) -> String {
+async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: &str, publisher: &RedisLogPublisher) -> String {
     let filename = format!("/tmp/zorp-{}.log", job_id);
     let path = std::path::Path::new(&filename);
 
@@ -618,10 +660,10 @@ async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: 
              error!("Failed to write to log file: {}", e);
         }
 
-        // Broadcast to real-time subscribers
+        // Broadcast to real-time subscribers via Redis
         // We convert bytes to string lossily
         let log_str = String::from_utf8_lossy(&msg).to_string();
-        let _ = tx.send(log_str);
+        let _ = publisher.publish(job_id, &log_str).await;
     }
 
     filename

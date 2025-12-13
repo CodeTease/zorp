@@ -12,13 +12,16 @@ use std::sync::Arc;
 use sqlx::Row;
 use serde::{Deserialize};
 use uuid::Uuid;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use bollard::Docker;
-use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, StreamRegistry};
+use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, ApiKey};
 use crate::queue::JobQueue;
 use crate::db::{DbPool, sql_placeholder};
 use crate::engine;
 use crate::metrics;
+use crate::streaming::RedisLogPublisher;
+use futures_util::StreamExt;
+use sha2::{Sha256, Digest};
 
 use aws_sdk_s3;
 use axum::body::Body;
@@ -31,13 +34,20 @@ pub struct AppState {
     pub secret_key: String,
     pub docker: Docker,
     pub job_registry: JobRegistry,
-    pub stream_registry: StreamRegistry,
     pub s3_client: Option<aws_sdk_s3::Client>,
     pub s3_bucket: Option<String>,
 }
 
+// --- AUTH CONTEXT ---
+#[derive(Clone, Debug)]
+pub struct AuthContext {
+    pub user_id: Option<String>,
+    pub permissions: Vec<String>,
+    pub role: String, // e.g. "admin", "viewer", "system"
+}
+
 // --- AUTH MIDDLEWARE ---
-struct Auth;
+struct Auth(AuthContext);
 
 #[async_trait]
 impl FromRequestParts<Arc<AppState>> for Auth {
@@ -46,8 +56,38 @@ impl FromRequestParts<Arc<AppState>> for Auth {
         if let Some(auth_header) = parts.headers.get(header::AUTHORIZATION) {
             if let Ok(auth_str) = auth_header.to_str() {
                 if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                    // 1. Check Legacy/Root Key
                     if token == state.secret_key {
-                        return Ok(Self);
+                        return Ok(Auth(AuthContext {
+                            user_id: None,
+                            permissions: vec!["*".to_string()],
+                            role: "admin".to_string(),
+                        }));
+                    }
+
+                    // 2. Check Database API Keys (Hashed)
+                    let mut hasher = Sha256::new();
+                    hasher.update(token.as_bytes());
+                    let result = hasher.finalize();
+                    let key_hash = hex::encode(result);
+
+                    // Dynamic SQL: SELECT * FROM api_keys WHERE key_hash = $1
+                    let query = format!("SELECT * FROM api_keys WHERE key_hash = {}", sql_placeholder(1));
+                    
+                    if let Ok(Some(api_key)) = sqlx::query_as::<_, ApiKey>(&query)
+                        .bind(key_hash)
+                        .fetch_optional(&state.db).await 
+                    {
+                        // Parse permissions
+                        let permissions = api_key.permissions
+                            .map(|p| p.split(',').map(|s| s.trim().to_string()).collect())
+                            .unwrap_or_default();
+
+                        return Ok(Auth(AuthContext {
+                            user_id: Some(api_key.user_id),
+                            permissions,
+                            role: "user".to_string(), // In future, fetch user role
+                        }));
                     }
                 }
             }
@@ -70,25 +110,59 @@ async fn health_check() -> &'static str {
     }
 }
 
+async fn handle_healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    // 1. Check Database
+    let db_status = sqlx::query("SELECT 1").execute(&state.db).await;
+    
+    // 2. Check Redis
+    let redis_status = state.queue.ping().await;
+
+    if db_status.is_ok() && redis_status.is_ok() {
+        (StatusCode::OK, Json(serde_json::json!({
+            "status": "ok",
+            "db": "connected",
+            "redis": "connected"
+        })))
+    } else {
+        let db_err = db_status.as_ref().err();
+        let redis_err = redis_status.as_ref().err();
+        error!("Health check failed: DB={:?}, Redis={:?}", db_err, redis_err);
+        
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "status": "error",
+            "db": if db_status.is_ok() { "connected" } else { "disconnected" },
+            "redis": if redis_status.is_ok() { "connected" } else { "disconnected" }
+        })))
+    }
+}
+
 async fn handle_metrics() -> String {
     metrics::get_metrics()
 }
 
 async fn handle_dispatch(
     State(state): State<Arc<AppState>>,
-    _: Auth,
+    Auth(auth): Auth,
     Json(payload): Json<JobRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // RBAC Check
+    if auth.role != "admin" && !auth.permissions.contains(&"dispatch".to_string()) && !auth.permissions.contains(&"*".to_string()) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Insufficient permissions"})));
+    }
+
     let job_id = Uuid::new_v4().to_string();
+    let user_id = auth.user_id.or(payload.user.clone()); // Prefer Auth user_id, fallback to payload user if allowed (or none)
     
     // 1. Persist to DB first (Status: QUEUED)
-    // Dynamic SQL: INSERT INTO jobs (...) VALUES ($1, 'QUEUED', $2, $3, $4)
+    // Dynamic SQL: INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES ($1, 'QUEUED', $2, $3, $4, $5)
+    // Note: user_id needs to be added to DB via migration first.
     let query = format!(
-        "INSERT INTO jobs (id, status, image, commands, callback_url) VALUES ({}, 'QUEUED', {}, {}, {})",
+        "INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES ({}, 'QUEUED', {}, {}, {}, {})",
         sql_placeholder(1), // id
         sql_placeholder(2), // image
         sql_placeholder(3), // commands
-        sql_placeholder(4)  // callback_url
+        sql_placeholder(4), // callback_url
+        sql_placeholder(5)  // user_id
     );
 
     let insert_result = sqlx::query(&query)
@@ -96,6 +170,7 @@ async fn handle_dispatch(
     .bind(&payload.image)
     .bind(serde_json::to_string(&payload.commands).unwrap_or_default())
     .bind(&payload.callback_url)
+    .bind(&user_id)
     .execute(&state.db).await;
 
     match insert_result {
@@ -109,7 +184,8 @@ async fn handle_dispatch(
                 callback_url: payload.callback_url,
                 timeout_seconds: payload.timeout_seconds,
                 artifacts_path: payload.artifacts_path,
-                user: payload.user,
+                user: user_id,
+                retry_count: 0,
             };
 
             // 2. Push to Redis Queue
@@ -151,9 +227,14 @@ async fn handle_dispatch(
 
 async fn handle_cancel_job(
     State(state): State<Arc<AppState>>,
-    _: Auth,
+    Auth(auth): Auth,
     Path(job_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // RBAC Check
+    if auth.role != "admin" && !auth.permissions.contains(&"cancel".to_string()) && !auth.permissions.contains(&"*".to_string()) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Insufficient permissions"})));
+    }
+
     match engine::cancel_job(&state.docker, &state.job_registry, &job_id, &state.db).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({
             "status": "cancelled",
@@ -174,7 +255,7 @@ async fn handle_get_job(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Dynamic SQL: SELECT ... FROM jobs WHERE id = $1
     let query = format!(
-        "SELECT id, status, exit_code, image, created_at FROM jobs WHERE id = {}",
+        "SELECT id, status, exit_code, image, created_at, user_id FROM jobs WHERE id = {}",
         sql_placeholder(1)
     );
 
@@ -247,29 +328,27 @@ async fn handle_get_job_logs(
 
 // --- SSE LOG STREAMING ---
 async fn handle_stream_logs(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>, // Added underscore
     Path(job_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     info!("Client connected to stream logs for job: {}", job_id);
 
-    // Try to get broadcast receiver from registry
-    let rx = {
-        let registry = state.stream_registry.read().await;
-        registry.get(&job_id).map(|tx| tx.subscribe())
-    };
+    // Redis Subscriber
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let publisher = RedisLogPublisher::new(&redis_url);
 
     let stream = async_stream::stream! {
-        if let Some(mut rx) = rx {
-            // Job is running, stream live logs
-            while let Ok(msg) = rx.recv().await {
-                yield Ok(Event::default().data(msg));
+        match publisher.subscribe(&job_id).await {
+            Ok(mut rx) => {
+                 while let Some(msg) = rx.next().await {
+                     yield Ok(Event::default().data(msg));
+                 }
+                 yield Ok(Event::default().data("[Stream Ended: Redis Connection Closed]"));
+            },
+            Err(e) => {
+                error!("Failed to subscribe to redis log channel for {}: {}", job_id, e);
+                yield Ok(Event::default().data("[Error: Failed to connect to log stream]"));
             }
-            yield Ok(Event::default().data("[Stream Ended: Job Finished]"));
-        } else {
-            // Job not running or not found.
-            // Check if it's finished by querying DB?
-            // For now just say it's not live.
-            yield Ok(Event::default().data("[Error: Job is not running or live stream unavailable. Check /logs endpoint.]"));
         }
     };
 
@@ -294,7 +373,7 @@ async fn handle_list_jobs(
     #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     type BuildDb = sqlx::Sqlite;
 
-    let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at FROM jobs");
+    let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at, user_id FROM jobs");
 
     if let Some(status) = query.status {
         q_builder.push(" WHERE status = ");
@@ -320,6 +399,7 @@ async fn handle_list_jobs(
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health_check))
+        .route("/healthz", get(handle_healthz))
         .route("/metrics", get(handle_metrics))
         .route("/dispatch", post(handle_dispatch))
         .route("/job/:id", delete(handle_cancel_job).get(handle_get_job))

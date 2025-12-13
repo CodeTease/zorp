@@ -7,6 +7,7 @@ mod engine;
 mod models;
 mod queue;
 mod metrics; // Added metrics module
+mod streaming; // Added streaming module
 
 use bollard::Docker;
 use dotenvy::dotenv;
@@ -17,14 +18,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info, warn}; 
 use crate::queue::{RedisQueue, JobQueue};
-use crate::models::{JobRegistry, StreamRegistry};
+use crate::models::{JobRegistry};
 use tokio::sync::RwLock;
 use std::collections::HashMap;
 use bollard::container::ListContainersOptions;
 use crate::db::sql_placeholder;
 
 const PORT: u16 = 3000;
-const MAX_CONCURRENT_JOBS: usize = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,8 +42,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(":: Zorp v0.1.0 (Production Edition) ::");
     
-    // 1. Initialize DB
-    let db_pool = db::init_pool().await?;
+    // 1. Initialize DB (with Retry)
+    let mut db_retry_attempts = 0;
+    let db_pool = loop {
+        match db::init_pool().await {
+            Ok(pool) => break pool,
+            Err(e) => {
+                db_retry_attempts += 1;
+                if db_retry_attempts > 5 {
+                    error!("❌ Failed to connect to DB after 5 attempts. Exiting.");
+                    return Err(e);
+                }
+                warn!("⚠️  DB Connection failed: {}. Retrying in 5s... ({}/5)", e, db_retry_attempts);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    };
+    info!("✅ Database connected successfully.");
 
     // 2. Initialize Redis Queue
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -68,10 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Initialize Docker
     let docker = Docker::connect_with_local_defaults()?;
 
-    // 3b. Initialize JobRegistry & StreamRegistry
+    // 3b. Initialize JobRegistry
     info!("🔄 Performing State Reconciliation...");
     let job_registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
-    let stream_registry: StreamRegistry = Arc::new(RwLock::new(HashMap::new()));
     
     let mut filters = HashMap::new();
     filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
@@ -113,7 +127,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✅ State Reconciliation Complete. Active Jobs: {}", job_registry.read().await.len());
 
     // 4. Run Zombie Reaper (Background Task)
-    engine::spawn_reaper_task(docker.clone(), db_pool.clone());
+    engine::spawn_reaper_task(docker.clone(), db_pool.clone(), job_registry.clone());
+
+    // 4b. Run Queue Monitor (Background Task) - Heartbeat & Auto-Recovery
+    let queue_monitor = queue.clone();
+    tokio::spawn(async move {
+        info!("❤️  Queue Monitor (Heartbeat & Auto-Recovery) started.");
+        loop {
+            // Monitor stranded jobs every 30s
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Err(e) = queue_monitor.monitor_stranded_jobs().await {
+                error!("❌ Queue Monitor Error: {}", e);
+            }
+        }
+    });
 
     // 5. Initialize Engine (Dispatcher)
     let http_client = reqwest::Client::builder()
@@ -138,14 +165,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
+
+    // Configuration
+    let max_jobs = env::var("ZORP_MAX_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    info!("⚙️  Configuration: ZORP_MAX_JOBS = {}", max_jobs);
     
     let dispatcher = Arc::new(engine::Dispatcher::new(
         docker.clone(),
         db_pool.clone(),
         http_client,
-        MAX_CONCURRENT_JOBS,
+        max_jobs,
         job_registry.clone(),
-        stream_registry.clone(),
         s3_client.clone(),
         s3_bucket.clone(),
         secret_key.clone(),
@@ -155,17 +188,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Spawn WORKER THREAD (with Graceful Shutdown support)
     let queue_for_worker = queue.clone();
     let dispatcher_for_worker = dispatcher.clone();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let (shutdown_tx, mut _shutdown_rx) = tokio::sync::broadcast::channel(1); // Fixed unused warning
     
     let worker_shutdown_rx = shutdown_tx.subscribe();
 
-    tokio::spawn(async move {
+    let worker_handle = tokio::spawn(async move {
         info!("👷 Worker thread started.");
         let mut shutdown = worker_shutdown_rx;
         loop {
             tokio::select! {
                 _ = shutdown.recv() => {
-                    info!("👷 Worker thread stopping...");
+                    info!("👷 Worker thread stopping (stop accepting new jobs)...");
                     break;
                 }
                 job = queue_for_worker.dequeue() => {
@@ -185,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        info!("👷 Worker thread stopped.");
     });
 
     // 7. Setup App State
@@ -194,7 +228,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secret_key,
         docker: docker,
         job_registry: job_registry,
-        stream_registry: stream_registry,
         s3_client: Some(s3_client),
         s3_bucket: Some(s3_bucket),
     });
@@ -233,6 +266,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!("🛑 Shutdown signal received.");
             let _ = shutdown_tx.send(());
+
+            // --- GRACEFUL SHUTDOWN DRAIN LOGIC ---
+            info!("⏳ Waiting for worker thread to stop...");
+            let _ = worker_handle.await;
+
+            info!("⏳ Draining active jobs...");
+            let drain_timeout = std::time::Duration::from_secs(60); // 60s hard timeout
+            let start_drain = std::time::Instant::now();
+            
+            loop {
+                let running = metrics::get_running(); // You'll need to expose this or use existing getter
+                if running == 0 {
+                    info!("✅ All jobs finished.");
+                    break;
+                }
+
+                if start_drain.elapsed() > drain_timeout {
+                    warn!("⚠️  Shutdown timeout reached! Forcefully killing {} running jobs.", running);
+                    break;
+                }
+
+                info!("⏳ Waiting for {} active jobs to finish...", running);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         })
         .await
         .unwrap();
