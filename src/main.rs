@@ -25,7 +25,6 @@ use bollard::container::ListContainersOptions;
 use crate::db::sql_placeholder;
 
 const PORT: u16 = 3000;
-const MAX_CONCURRENT_JOBS: usize = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -151,12 +150,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
+
+    // Configuration
+    let max_jobs = env::var("ZORP_MAX_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    info!("⚙️  Configuration: ZORP_MAX_JOBS = {}", max_jobs);
     
     let dispatcher = Arc::new(engine::Dispatcher::new(
         docker.clone(),
         db_pool.clone(),
         http_client,
-        MAX_CONCURRENT_JOBS,
+        max_jobs,
         job_registry.clone(),
         s3_client.clone(),
         s3_bucket.clone(),
@@ -171,13 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let worker_shutdown_rx = shutdown_tx.subscribe();
 
-    tokio::spawn(async move {
+    let worker_handle = tokio::spawn(async move {
         info!("👷 Worker thread started.");
         let mut shutdown = worker_shutdown_rx;
         loop {
             tokio::select! {
                 _ = shutdown.recv() => {
-                    info!("👷 Worker thread stopping...");
+                    info!("👷 Worker thread stopping (stop accepting new jobs)...");
                     break;
                 }
                 job = queue_for_worker.dequeue() => {
@@ -197,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        info!("👷 Worker thread stopped.");
     });
 
     // 7. Setup App State
@@ -244,6 +251,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!("🛑 Shutdown signal received.");
             let _ = shutdown_tx.send(());
+
+            // --- GRACEFUL SHUTDOWN DRAIN LOGIC ---
+            info!("⏳ Waiting for worker thread to stop...");
+            let _ = worker_handle.await;
+
+            info!("⏳ Draining active jobs...");
+            let drain_timeout = std::time::Duration::from_secs(60); // 60s hard timeout
+            let start_drain = std::time::Instant::now();
+            
+            loop {
+                let running = metrics::get_running(); // You'll need to expose this or use existing getter
+                if running == 0 {
+                    info!("✅ All jobs finished.");
+                    break;
+                }
+
+                if start_drain.elapsed() > drain_timeout {
+                    warn!("⚠️  Shutdown timeout reached! Forcefully killing {} running jobs.", running);
+                    break;
+                }
+
+                info!("⏳ Waiting for {} active jobs to finish...", running);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         })
         .await
         .unwrap();

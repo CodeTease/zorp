@@ -10,6 +10,7 @@ pub fn dec_queued() { JOBS_QUEUED.fetch_sub(1, Ordering::Relaxed); }
 
 pub fn inc_running() { JOBS_RUNNING.fetch_add(1, Ordering::Relaxed); }
 pub fn dec_running() { JOBS_RUNNING.fetch_sub(1, Ordering::Relaxed); }
+pub fn get_running() -> usize { JOBS_RUNNING.load(Ordering::Relaxed) }
 
 pub fn inc_completed() { JOBS_COMPLETED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_failed() { JOBS_FAILED.fetch_add(1, Ordering::Relaxed); }

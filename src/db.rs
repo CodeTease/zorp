@@ -39,11 +39,17 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
             ("idle_in_transaction_session_timeout", "60000"),
         ]);
 
+        let max_conns = env::var("ZORP_DB_MAX_CONNS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        let min_conns = env::var("ZORP_DB_MIN_CONNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let timeout = env::var("ZORP_DB_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+
+        info!("⚙️  DB Config (PG): Max={}, Min={}, Timeout={}s", max_conns, min_conns, timeout);
+
         let pool = PgPoolOptions::new()
-            .max_connections(50)
-            .min_connections(10)
+            .max_connections(max_conns)
+            .min_connections(min_conns)
             .max_lifetime(Duration::from_secs(30 * 60)) 
-            .acquire_timeout(Duration::from_secs(30)) 
+            .acquire_timeout(Duration::from_secs(timeout)) 
             .connect_with(connect_options).await?;
 
         // Run migrations
@@ -89,8 +95,11 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
 
+        let max_conns = env::var("ZORP_DB_MAX_CONNS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        info!("⚙️  DB Config (SQLite): Max={}", max_conns);
+
         let pool = SqlitePoolOptions::new()
-            .max_connections(50) 
+            .max_connections(max_conns) 
             .connect_with(options).await?;
 
         // Run migrations

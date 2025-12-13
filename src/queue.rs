@@ -13,6 +13,7 @@ pub trait JobQueue: Send + Sync {
     async fn restore_stranded(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
     async fn update_heartbeat(&self, job_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn monitor_stranded_jobs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
+    async fn ping(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // --- REDIS IMPLEMENTATION ---
@@ -173,5 +174,15 @@ impl JobQueue for RedisQueue {
         }
 
         Ok(restored_count)
+    }
+
+    async fn ping(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        let _: String = redis::cmd("PING").query_async(&mut conn).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        Ok(())
     }
 }

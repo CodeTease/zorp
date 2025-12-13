@@ -110,6 +110,32 @@ async fn health_check() -> &'static str {
     }
 }
 
+async fn handle_healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    // 1. Check Database
+    let db_status = sqlx::query("SELECT 1").execute(&state.db).await;
+    
+    // 2. Check Redis
+    let redis_status = state.queue.ping().await;
+
+    if db_status.is_ok() && redis_status.is_ok() {
+        (StatusCode::OK, Json(serde_json::json!({
+            "status": "ok",
+            "db": "connected",
+            "redis": "connected"
+        })))
+    } else {
+        let db_err = db_status.as_ref().err();
+        let redis_err = redis_status.as_ref().err();
+        error!("Health check failed: DB={:?}, Redis={:?}", db_err, redis_err);
+        
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "status": "error",
+            "db": if db_status.is_ok() { "connected" } else { "disconnected" },
+            "redis": if redis_status.is_ok() { "connected" } else { "disconnected" }
+        })))
+    }
+}
+
 async fn handle_metrics() -> String {
     metrics::get_metrics()
 }
@@ -372,6 +398,7 @@ async fn handle_list_jobs(
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health_check))
+        .route("/healthz", get(handle_healthz))
         .route("/metrics", get(handle_metrics))
         .route("/dispatch", post(handle_dispatch))
         .route("/job/:id", delete(handle_cancel_job).get(handle_get_job))
