@@ -498,7 +498,7 @@ impl Dispatcher {
             }
 
             if final_status == "FAILED" || final_status == "TIMED_OUT" || final_status == "CANCELLED" {
-                metrics::inc_failed();
+                metrics::inc_failed(final_status);
             } else {
                 metrics::inc_completed();
             }
