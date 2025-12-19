@@ -185,6 +185,11 @@ async fn handle_dispatch(
                 timeout_seconds: payload.timeout_seconds,
                 artifacts_path: payload.artifacts_path,
                 user: user_id,
+                cache_key: payload.cache_key,
+                cache_paths: payload.cache_paths,
+                on_success: payload.on_success,
+                debug: payload.debug,
+                priority: payload.priority,
                 retry_count: 0,
             };
 
@@ -255,7 +260,7 @@ async fn handle_get_job(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Dynamic SQL: SELECT ... FROM jobs WHERE id = $1
     let query = format!(
-        "SELECT id, status, exit_code, image, created_at, user_id FROM jobs WHERE id = {}",
+        "SELECT id, status, exit_code, image, created_at, user_id, artifact_url FROM jobs WHERE id = {}",
         sql_placeholder(1)
     );
 
@@ -373,7 +378,7 @@ async fn handle_list_jobs(
     #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     type BuildDb = sqlx::Sqlite;
 
-    let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at, user_id FROM jobs");
+    let mut q_builder = sqlx::query_builder::QueryBuilder::<BuildDb>::new("SELECT id, status, exit_code, image, created_at, user_id, artifact_url FROM jobs");
 
     if let Some(status) = query.status {
         q_builder.push(" WHERE status = ");

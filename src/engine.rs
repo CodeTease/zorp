@@ -4,7 +4,7 @@ use bollard::container::{
     StopContainerOptions, PruneContainersOptions,
 };
 use bollard::image::{CreateImageOptions, PruneImagesOptions};
-use bollard::volume::PruneVolumesOptions;
+use bollard::volume::{PruneVolumesOptions, CreateVolumeOptions, ListVolumesOptions}; // Added CreateVolumeOptions, ListVolumesOptions
 use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::TryStreamExt; 
@@ -24,6 +24,7 @@ use bollard::network::CreateNetworkOptions;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
+use uuid::Uuid;
 
 use aws_sdk_s3;
 
@@ -106,6 +107,12 @@ async fn reap_zombies(docker: &Docker, db: &DbPool) {
                 .and_then(|l| l.get("job_id"))
                 .cloned();
 
+            // Check if it's a DEBUG container
+            let is_debug = c.labels.as_ref()
+                .and_then(|l| l.get("zorp_debug"))
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
             if let Some(jid) = job_id {
                  let query = format!("SELECT status FROM jobs WHERE id = {}", sql_placeholder(1));
                  let row = sqlx::query_as::<_, (String,)>(&query)
@@ -119,14 +126,21 @@ async fn reap_zombies(docker: &Docker, db: &DbPool) {
                  };
 
                  if should_kill {
+                     // If it is DEBUG, we don't kill it immediately here. 
+                     // Garbage collection will handle it based on TTL.
+                     // But if it is actively running and marked as finished in DB, we SHOULD stop it.
                      if c.state.as_deref() == Some("running") {
                          warn!("逐 Reaper: Found active zombie {} (Job {}). Terminating...", c.id.as_deref().unwrap_or("?"), jid);
                          if let Some(id) = c.id.as_ref() {
                             let _ = docker.kill_container::<String>(id, None).await;
                          }
                      }
-                     if let Some(id) = c.id.as_ref() {
-                        let _ = docker.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+                     
+                     // Removal: Only if NOT debug. Debug containers stay until GC.
+                     if !is_debug {
+                         if let Some(id) = c.id.as_ref() {
+                            let _ = docker.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+                         }
                      }
                  }
             }
@@ -170,12 +184,45 @@ async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
         }
     }
 
-    // 2. Prune Docker Resources
+    // 2. Clean up Debug Containers (> 30 mins)
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("label".to_string(), vec!["zorp_debug=true".to_string()]);
+    
+    let options = ListContainersOptions {
+        all: true,
+        filters: filters.clone(),
+        ..Default::default()
+    };
+
+    if let Ok(containers) = docker.list_containers(Some(options)).await {
+        for c in containers {
+             if let Some(created) = c.created {
+                 // Docker timestamp is usually unix timestamp
+                 let created_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(created as u64);
+                 if let Ok(age) = SystemTime::now().duration_since(created_time) {
+                     if age > std::time::Duration::from_secs(1800) { // 30 mins
+                         if let Some(id) = c.id {
+                             info!("🧹 GC: Removing expired debug container {}", id);
+                             let _ = docker.remove_container(&id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+                         }
+                     }
+                 }
+             }
+        }
+    }
+
+    // 3. Prune Docker Resources
     let mut filters = std::collections::HashMap::new();
     filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
     
-    // Prune containers
-    let _ = docker.prune_containers(Some(PruneContainersOptions { filters: filters.clone() })).await;
+    // Prune containers (Only stopped ones that are not debug and not recent)
+    // Actually prune_containers is aggressive. We should rely on auto-remove or explicit remove.
+    // The previous implementation used prune which might be too broad if we want to keep debug ones.
+    // But we filtered by label managed_by=zorp. 
+    // We should probably filter out zorp_debug=true for pruning.
+    // Unfortunately bollard/docker prune filters are limited (label=key=value).
+    // So we'll skip global prune for now to protect debug containers, relying on explicit removal in dispatch and reap_zombies.
+    // let _ = docker.prune_containers(Some(PruneContainersOptions { filters: filters.clone() })).await;
 
     // Prune images (dangling)
     let _ = docker.prune_images(Some(PruneImagesOptions::<String> { filters: std::collections::HashMap::new() })).await; 
@@ -319,6 +366,44 @@ impl Dispatcher {
                 let mut labels = std::collections::HashMap::new();
                 labels.insert("managed_by".to_string(), "zorp".to_string());
                 labels.insert("job_id".to_string(), job.id.clone());
+                if job.debug {
+                    labels.insert("zorp_debug".to_string(), "true".to_string());
+                }
+
+                // --- HOT VOLUMES (CACHING) ---
+                let mut binds = Vec::new();
+                if let Some(cache_key) = &job.cache_key {
+                    let volume_name = format!("zorp-cache-{}", cache_key);
+                    
+                    // Check if volume exists, if not create it
+                    let mut filters = std::collections::HashMap::new();
+                    filters.insert("name".to_string(), vec![volume_name.clone()]);
+                    let list_opts = ListVolumesOptions { filters };
+                    
+                    let exists = match docker.list_volumes(Some(list_opts)).await {
+                         Ok(res) => res.volumes.map(|v| !v.is_empty()).unwrap_or(false),
+                         Err(_) => false,
+                    };
+
+                    if !exists {
+                         let create_opts = CreateVolumeOptions {
+                             name: volume_name.clone(),
+                             labels: labels.clone(), // Tag volume with same labels (managed_by=zorp)
+                             ..Default::default()
+                         };
+                         if let Err(e) = docker.create_volume(create_opts).await {
+                             warn!("[{}] Failed to create cache volume {}: {}", job.id, volume_name, e);
+                         } else {
+                             info!("[{}] Created cache volume: {}", job.id, volume_name);
+                         }
+                    }
+
+                    if let Some(paths) = &job.cache_paths {
+                        for path in paths {
+                            binds.push(format!("{}:{}", volume_name, path));
+                        }
+                    }
+                }
 
                 let config = Config {
                     image: Some(job.image.clone()),
@@ -337,6 +422,7 @@ impl Dispatcher {
                         network_mode: Some(ZORP_NETWORK_NAME.to_string()),
                         // Extra Hosts: Block metadata service
                         extra_hosts: Some(vec!["169.254.169.254:127.0.0.1".to_string()]),
+                        binds: Some(binds), // Added Binds for Volumes
                         ..Default::default()
                     }),
                     // Configurable User
@@ -482,7 +568,11 @@ impl Dispatcher {
                     }
                 }
 
-                let _ = docker.remove_container(&container_name, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+                if !job.debug {
+                    let _ = docker.remove_container(&container_name, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+                } else {
+                    info!("[{}] Debug mode enabled. Container kept.", job.id);
+                }
             }
 
             // Clean up registry
@@ -495,6 +585,60 @@ impl Dispatcher {
                  final_status = "FAILED";
             } else if final_exit_code != 0 {
                  final_status = "FAILED";
+            }
+
+            // --- JOB CHAINING (DAG) ---
+            if final_exit_code == 0 && final_status != "FAILED" && final_status != "TIMED_OUT" && final_status != "CANCELLED" {
+                if !job.on_success.is_empty() {
+                    info!("[{}] Triggering {} downstream jobs...", job.id, job.on_success.len());
+                    for next_req in &job.on_success {
+                        let next_id = Uuid::new_v4().to_string();
+                        // Persist to DB first
+                         let query = format!(
+                            "INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES ({}, 'QUEUED', {}, {}, {}, {})",
+                            sql_placeholder(1), sql_placeholder(2), sql_placeholder(3), sql_placeholder(4), sql_placeholder(5)
+                        );
+
+                        // Inherit user_id from parent if not specified
+                        let next_user_id = next_req.user.clone().or(job.user.clone());
+
+                        let insert_result = sqlx::query(&query)
+                            .bind(&next_id)
+                            .bind(&next_req.image)
+                            .bind(serde_json::to_string(&next_req.commands).unwrap_or_default())
+                            .bind(&next_req.callback_url)
+                            .bind(&next_user_id)
+                            .execute(&db).await;
+                        
+                        if let Ok(_) = insert_result {
+                            let next_context = JobContext {
+                                id: next_id.clone(),
+                                image: next_req.image.clone(),
+                                commands: next_req.commands.clone(),
+                                env: next_req.env.clone(),
+                                limits: next_req.limits.clone().map(Arc::new),
+                                callback_url: next_req.callback_url.clone(),
+                                timeout_seconds: next_req.timeout_seconds,
+                                artifacts_path: next_req.artifacts_path.clone(),
+                                user: next_user_id,
+                                cache_key: next_req.cache_key.clone(),
+                                cache_paths: next_req.cache_paths.clone(),
+                                on_success: next_req.on_success.clone(),
+                                debug: next_req.debug,
+                                priority: next_req.priority.clone(),
+                                retry_count: 0,
+                            };
+                            
+                            if let Err(e) = queue.enqueue(next_context).await {
+                                error!("[{}] Failed to enqueue chained job {}: {}", job.id, next_id, e);
+                            } else {
+                                info!("[{}] Enqueued chained job: {}", job.id, next_id);
+                            }
+                        } else {
+                             error!("[{}] Failed to persist chained job {}: {:?}", job.id, next_id, insert_result.err());
+                        }
+                    }
+                }
             }
 
             if final_status == "FAILED" || final_status == "TIMED_OUT" || final_status == "CANCELLED" {

@@ -14,7 +14,7 @@ pub struct JobLimits {
     pub cpu_cores: Option<f32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct JobRequest {
     pub image: String,
     pub commands: Vec<String>,
@@ -24,6 +24,13 @@ pub struct JobRequest {
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
     pub user: Option<String>, // New field for configurable user
+    pub cache_key: Option<String>,
+    pub cache_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub on_success: Vec<JobRequest>,
+    #[serde(default)]
+    pub debug: bool,
+    pub priority: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -49,6 +56,13 @@ pub struct JobContext {
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
     pub user: Option<String>, // New field for configurable user
+    pub cache_key: Option<String>,
+    pub cache_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub on_success: Vec<JobRequest>,
+    #[serde(default)]
+    pub debug: bool,
+    pub priority: Option<String>,
     #[serde(default)]
     pub retry_count: u32,
 }

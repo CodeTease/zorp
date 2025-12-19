@@ -19,7 +19,9 @@ pub trait JobQueue: Send + Sync {
 // --- REDIS IMPLEMENTATION ---
 pub struct RedisQueue {
     client: redis::Client,
-    queue_name: String,
+    queue_name: String, // Default/Normal queue
+    queue_high: String,
+    queue_low: String,
     processing_queue_name: String,
 }
 
@@ -28,37 +30,24 @@ impl RedisQueue {
         let client = redis::Client::open(url).expect("Invalid Redis URL");
         Self {
             client,
-            queue_name: "zorp_jobs".to_string(),
+            queue_name: "zorp_jobs_normal".to_string(),
+            queue_high: "zorp_jobs_high".to_string(),
+            queue_low: "zorp_jobs_low".to_string(),
             processing_queue_name: "zorp_jobs:processing".to_string(),
         }
     }
-}
 
-#[async_trait]
-impl JobQueue for RedisQueue {
-    async fn enqueue(&self, job: JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            
-        let payload = serde_json::to_string(&job)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        
-        // LPUSH: Push to the left side of the list
-        let _: () = conn.lpush(&self.queue_name, payload).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            
-        Ok(())
+    fn get_queue_for_priority(&self, priority: Option<&str>) -> &str {
+        match priority {
+            Some("high") | Some("HIGH") => &self.queue_high,
+            Some("low") | Some("LOW") => &self.queue_low,
+            _ => &self.queue_name,
+        }
     }
 
-    async fn dequeue(&self) -> Result<Option<JobContext>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        
-        // Reliable Queue: BRPOPLPUSH source destination timeout
-        // Moves item from tail of source to head of destination safely.
-        let payload: Option<String> = conn.brpoplpush(&self.queue_name, &self.processing_queue_name, 0.0).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
+    async fn process_payload(&self, payload: Option<String>, conn: &mut redis::aio::MultiplexedConnection) 
+        -> Result<Option<JobContext>, Box<dyn std::error::Error + Send + Sync>> 
+    {
         match payload {
             Some(payload_str) => {
                 let job: JobContext = serde_json::from_str(&payload_str)
@@ -73,6 +62,65 @@ impl JobQueue for RedisQueue {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[async_trait]
+impl JobQueue for RedisQueue {
+    async fn enqueue(&self, job: JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let payload = serde_json::to_string(&job)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        let target_queue = self.get_queue_for_priority(job.priority.as_deref());
+
+        // LPUSH: Push to the left side of the list
+        let _: () = conn.lpush(target_queue, payload).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        Ok(())
+    }
+
+    async fn dequeue(&self) -> Result<Option<JobContext>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        // Priority Dequeue Logic:
+        // 1. Check HIGH (Non-blocking rpoplpush)
+        // 2. Check NORMAL (Non-blocking rpoplpush)
+        // 3. Check LOW (Blocking brpoplpush with short timeout to circle back to HIGH)
+
+        // Try HIGH
+        // Note: rpoplpush is not available in redis crate async commands directly as a method sometimes?
+        // Checking docs/usage: cmd("RPOPLPUSH").arg(src).arg(dst)
+        let payload: Option<String> = redis::cmd("RPOPLPUSH")
+            .arg(&self.queue_high)
+            .arg(&self.processing_queue_name)
+            .query_async(&mut conn).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if payload.is_some() {
+             return self.process_payload(payload, &mut conn).await;
+        }
+
+        // Try NORMAL
+        let payload: Option<String> = redis::cmd("RPOPLPUSH")
+            .arg(&self.queue_name)
+            .arg(&self.processing_queue_name)
+            .query_async(&mut conn).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if payload.is_some() {
+             return self.process_payload(payload, &mut conn).await;
+        }
+
+        // Try LOW (Blocking with timeout 1s)
+        let payload: Option<String> = conn.brpoplpush(&self.queue_low, &self.processing_queue_name, 1.0).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        self.process_payload(payload, &mut conn).await
     }
 
     async fn acknowledge(&self, job: &JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -128,8 +176,9 @@ impl JobQueue for RedisQueue {
                             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     } else {
                          let new_payload = serde_json::to_string(&job).unwrap();
-                         // Push back to main queue
-                         let _: () = conn.lpush(&self.queue_name, new_payload).await
+                         // Push back to appropriate queue based on priority
+                         let target_queue = self.get_queue_for_priority(job.priority.as_deref());
+                         let _: () = conn.lpush(target_queue, new_payload).await
                             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                          count += 1;
                     }
@@ -139,7 +188,7 @@ impl JobQueue for RedisQueue {
         }
         
         if count > 0 {
-            info!("Restored {} stranded jobs from '{}' to '{}'", count, self.processing_queue_name, self.queue_name);
+            info!("Restored {} stranded jobs from '{}'", count, self.processing_queue_name);
         }
         
         Ok(count)
@@ -189,7 +238,8 @@ impl JobQueue for RedisQueue {
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
                 if removed > 0 {
-                    let _: () = conn.lpush(&self.queue_name, &payload).await
+                    let target_queue = self.get_queue_for_priority(job.priority.as_deref());
+                    let _: () = conn.lpush(target_queue, &payload).await
                          .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     restored_count += 1;
                 }
