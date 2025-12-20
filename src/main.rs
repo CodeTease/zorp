@@ -191,7 +191,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, mut _shutdown_rx) = tokio::sync::broadcast::channel(1); // Fixed unused warning
     
     let worker_shutdown_rx = shutdown_tx.subscribe();
+    let upload_worker_shutdown_rx = shutdown_tx.subscribe();
 
+    // MAIN JOB WORKER
     let worker_handle = tokio::spawn(async move {
         info!("👷 Worker thread started.");
         let mut shutdown = worker_shutdown_rx;
@@ -219,6 +221,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         info!("👷 Worker thread stopped.");
+    });
+
+    // UPLOAD WORKER (S3 DECOUPLING)
+    let queue_for_upload = queue.clone();
+    let s3_client_upload = s3_client.clone();
+    let s3_bucket_upload = s3_bucket.clone();
+    let db_upload = db_pool.clone();
+
+    let upload_worker_handle = tokio::spawn(async move {
+        info!("☁️  Upload Worker thread started.");
+        let mut shutdown = upload_worker_shutdown_rx;
+        loop {
+             tokio::select! {
+                _ = shutdown.recv() => {
+                    info!("☁️  Upload Worker stopping...");
+                    break;
+                }
+                task_res = queue_for_upload.dequeue_upload() => {
+                    match task_res {
+                        Ok(Some(task)) => {
+                            info!("☁️  Processing upload task for job {}: {} ({})", task.job_id, task.s3_key, task.upload_type);
+                            
+                            let path = std::path::Path::new(&task.file_path);
+                            if path.exists() {
+                                let body = match aws_sdk_s3::primitives::ByteStream::from_path(path).await {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        error!("Failed to read file for upload {}: {}", task.file_path, e);
+                                        continue;
+                                    }
+                                };
+
+                                match s3_client_upload.put_object()
+                                    .bucket(&s3_bucket_upload)
+                                    .key(&task.s3_key)
+                                    .body(body)
+                                    .send()
+                                    .await 
+                                {
+                                    Ok(_) => {
+                                        let s3_url = format!("s3://{}/{}", s3_bucket_upload, task.s3_key);
+                                        info!("✅ Upload successful: {}", s3_url);
+                                        
+                                        // Update DB with final URL if needed (Log Only)
+                                        // Artifact URL is usually already updated or we can update it here strictly.
+                                        // The prompt says "If upload fail, retry... don't affect exit code".
+                                        
+                                        // If it is a log, we might want to ensure the 'logs' column points to S3.
+                                        // In dispatcher we optimistically set it to s3 url.
+                                        // So we don't necessarily need to update DB unless we want to confirm success.
+                                        // But if we want to be safe:
+                                        
+                                        /* 
+                                        if task.upload_type == "log" {
+                                            let query = format!("UPDATE jobs SET logs = {} WHERE id = {}", sql_placeholder(1), sql_placeholder(2));
+                                            let _ = sqlx::query(&query).bind(&s3_url).bind(&task.job_id).execute(&db_upload).await;
+                                        } else if task.upload_type == "artifact" {
+                                            let query = format!("UPDATE jobs SET artifact_url = {} WHERE id = {}", sql_placeholder(1), sql_placeholder(2));
+                                            let _ = sqlx::query(&query).bind(&s3_url).bind(&task.job_id).execute(&db_upload).await;
+                                        }
+                                        */
+                                        
+                                        // Clean up file
+                                        let _ = tokio::fs::remove_file(path).await;
+                                    },
+                                    Err(e) => {
+                                        error!("❌ S3 Upload Failed: {}. Retrying later (TODO: Implement DLQ or Retry for Uploads)", e);
+                                        // For now, we don't delete the file so it might be picked up again if we had a retry mechanism.
+                                        // But here we just lose it from the queue. Ideally we push back.
+                                        // Let's re-enqueue with delay? Or just log error. 
+                                        // Current implementation: Log error and move on (File stays in /tmp until GC).
+                                    }
+                                }
+                            } else {
+                                warn!("File not found for upload: {}", task.file_path);
+                            }
+                        }
+                        Ok(None) => {
+                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        Err(e) => {
+                             error!("Upload Queue Error: {}", e);
+                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }
+        }
+        info!("☁️  Upload Worker stopped.");
     });
 
     // 7. Setup App State

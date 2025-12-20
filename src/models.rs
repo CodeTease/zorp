@@ -67,6 +67,14 @@ pub struct JobContext {
     pub retry_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadTask {
+    pub job_id: String,
+    pub file_path: String,
+    pub upload_type: String, // "log" or "artifact"
+    pub s3_key: String,
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct User {
     pub id: String,

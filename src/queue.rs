@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use redis::AsyncCommands;
-use crate::models::JobContext;
+use crate::models::{JobContext, UploadTask};
 use tracing::{info, warn};
 
 // FIX: Added `+ Send + Sync` to the Boxed Error.
@@ -14,6 +14,10 @@ pub trait JobQueue: Send + Sync {
     async fn update_heartbeat(&self, job_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn monitor_stranded_jobs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
     async fn ping(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    
+    // Upload Queue
+    async fn enqueue_upload(&self, task: UploadTask) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn dequeue_upload(&self) -> Result<Option<UploadTask>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // --- REDIS IMPLEMENTATION ---
@@ -23,6 +27,7 @@ pub struct RedisQueue {
     queue_high: String,
     queue_low: String,
     processing_queue_name: String,
+    upload_queue_name: String,
 }
 
 impl RedisQueue {
@@ -34,6 +39,7 @@ impl RedisQueue {
             queue_high: "zorp_jobs_high".to_string(),
             queue_low: "zorp_jobs_low".to_string(),
             processing_queue_name: "zorp_jobs:processing".to_string(),
+            upload_queue_name: "zorp_uploads".to_string(),
         }
     }
 
@@ -261,5 +267,36 @@ impl JobQueue for RedisQueue {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         
         Ok(())
+    }
+
+    async fn enqueue_upload(&self, task: UploadTask) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let payload = serde_json::to_string(&task)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        let _: () = conn.lpush(&self.upload_queue_name, payload).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        Ok(())
+    }
+
+    async fn dequeue_upload(&self) -> Result<Option<UploadTask>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        // Blocking pop with timeout 1s
+        // We use explicit return type to clarify what we expect from BRPOP
+        let result: Option<(String, String)> = conn.brpop(&self.upload_queue_name, 1.0).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        if let Some((_, payload)) = result {
+             let task: UploadTask = serde_json::from_str(&payload)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+             Ok(Some(task))
+        } else {
+             Ok(None)
+        }
     }
 }

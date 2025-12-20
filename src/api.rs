@@ -117,21 +117,28 @@ async fn handle_healthz(State(state): State<Arc<AppState>>) -> (StatusCode, Json
     // 2. Check Redis
     let redis_status = state.queue.ping().await;
 
-    if db_status.is_ok() && redis_status.is_ok() {
+    // 3. Check Docker
+    let docker_status = state.docker.version().await;
+
+    if db_status.is_ok() && redis_status.is_ok() && docker_status.is_ok() {
         (StatusCode::OK, Json(serde_json::json!({
             "status": "ok",
             "db": "connected",
-            "redis": "connected"
+            "redis": "connected",
+            "docker": "connected"
         })))
     } else {
         let db_err = db_status.as_ref().err();
         let redis_err = redis_status.as_ref().err();
-        error!("Health check failed: DB={:?}, Redis={:?}", db_err, redis_err);
+        let docker_err = docker_status.as_ref().err();
+        
+        error!("Health check failed: DB={:?}, Redis={:?}, Docker={:?}", db_err, redis_err, docker_err);
         
         (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "status": "error",
             "db": if db_status.is_ok() { "connected" } else { "disconnected" },
-            "redis": if redis_status.is_ok() { "connected" } else { "disconnected" }
+            "redis": if redis_status.is_ok() { "connected" } else { "disconnected" },
+            "docker": if docker_status.is_ok() { "connected" } else { "disconnected" }
         })))
     }
 }

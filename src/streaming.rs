@@ -1,6 +1,7 @@
 use redis::AsyncCommands;
 use futures_util::StreamExt;
 
+#[derive(Clone)]
 pub struct RedisLogPublisher {
     client: redis::Client,
 }
