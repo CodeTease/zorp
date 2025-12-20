@@ -16,7 +16,7 @@ use tracing::{error, info};
 use bollard::Docker;
 use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, ApiKey};
 use crate::queue::JobQueue;
-use crate::db::{DbPool, sql_placeholder};
+use crate::db::DbPool;
 use crate::engine;
 use crate::metrics;
 use crate::streaming::RedisLogPublisher;
@@ -72,10 +72,10 @@ impl FromRequestParts<Arc<AppState>> for Auth {
                     let key_hash = hex::encode(result);
 
                     // Dynamic SQL: SELECT * FROM api_keys WHERE key_hash = $1
-                    let query = format!("SELECT * FROM api_keys WHERE key_hash = {}", sql_placeholder(1));
-                    
-                    if let Ok(Some(api_key)) = sqlx::query_as::<_, ApiKey>(&query)
-                        .bind(key_hash)
+                    let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT * FROM api_keys WHERE key_hash = ");
+                    q_builder.push_bind(key_hash);
+
+                    if let Ok(Some(api_key)) = q_builder.build_query_as::<ApiKey>()
                         .fetch_optional(&state.db).await 
                     {
                         // Parse permissions
@@ -161,24 +161,20 @@ async fn handle_dispatch(
     let user_id = auth.user_id.or(payload.user.clone()); // Prefer Auth user_id, fallback to payload user if allowed (or none)
     
     // 1. Persist to DB first (Status: QUEUED)
-    // Dynamic SQL: INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES ($1, 'QUEUED', $2, $3, $4, $5)
     // Note: user_id needs to be added to DB via migration first.
-    let query = format!(
-        "INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES ({}, 'QUEUED', {}, {}, {}, {})",
-        sql_placeholder(1), // id
-        sql_placeholder(2), // image
-        sql_placeholder(3), // commands
-        sql_placeholder(4), // callback_url
-        sql_placeholder(5)  // user_id
-    );
+    let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES (");
+    q_builder.push_bind(&job_id);
+    q_builder.push(", 'QUEUED', ");
+    q_builder.push_bind(&payload.image);
+    q_builder.push(", ");
+    q_builder.push_bind(serde_json::to_string(&payload.commands).unwrap_or_default());
+    q_builder.push(", ");
+    q_builder.push_bind(&payload.callback_url);
+    q_builder.push(", ");
+    q_builder.push_bind(&user_id);
+    q_builder.push(")");
 
-    let insert_result = sqlx::query(&query)
-    .bind(&job_id)
-    .bind(&payload.image)
-    .bind(serde_json::to_string(&payload.commands).unwrap_or_default())
-    .bind(&payload.callback_url)
-    .bind(&user_id)
-    .execute(&state.db).await;
+    let insert_result = q_builder.build().execute(&state.db).await;
 
     match insert_result {
         Ok(_) => {
@@ -216,15 +212,12 @@ async fn handle_dispatch(
                     
                     // Fallback update if queue fails
                     // Dynamic SQL: UPDATE jobs SET status = 'FAILED', logs = $1 WHERE id = $2
-                    let update_query = format!(
-                        "UPDATE jobs SET status = 'FAILED', logs = {} WHERE id = {}",
-                        sql_placeholder(1), sql_placeholder(2)
-                    );
+                    let mut q_fail = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'FAILED', logs = ");
+                    q_fail.push_bind(format!("System Error: Queue unavailable - {}", e));
+                    q_fail.push(" WHERE id = ");
+                    q_fail.push_bind(&job_id);
 
-                    let _ = sqlx::query(&update_query)
-                        .bind(format!("System Error: Queue unavailable - {}", e))
-                        .bind(&job_id)
-                        .execute(&state.db).await;
+                    let _ = q_fail.build().execute(&state.db).await;
 
                     (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Queue unavailable"})))
                 }
@@ -266,14 +259,11 @@ async fn handle_get_job(
     Path(job_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Dynamic SQL: SELECT ... FROM jobs WHERE id = $1
-    let query = format!(
-        "SELECT id, status, exit_code, image, created_at, user_id, artifact_url FROM jobs WHERE id = {}",
-        sql_placeholder(1)
-    );
+    let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT id, status, exit_code, image, created_at, user_id, artifact_url FROM jobs WHERE id = ");
+    q_builder.push_bind(job_id);
 
-    let row = sqlx::query_as::<_, JobStatus>(&query)
-    .bind(job_id)
-    .fetch_optional(&state.db).await;
+    let row = q_builder.build_query_as::<JobStatus>()
+        .fetch_optional(&state.db).await;
 
     match row {
         Ok(Some(job)) => (StatusCode::OK, Json(serde_json::to_value(job).unwrap_or_default())),
@@ -293,12 +283,10 @@ async fn handle_get_job_logs(
     Path(job_id): Path<String>,
 ) -> Response {
     // Dynamic SQL: SELECT logs FROM jobs WHERE id = $1
-    let query = format!("SELECT logs FROM jobs WHERE id = {}", sql_placeholder(1));
-
-    let result = sqlx::query(&query)
-        .bind(&job_id)
-        .fetch_optional(&state.db)
-        .await;
+    let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT logs FROM jobs WHERE id = ");
+    q_builder.push_bind(&job_id);
+    
+    let result = q_builder.build().fetch_optional(&state.db).await;
 
     match result {
         Ok(Some(row)) => {

@@ -73,6 +73,8 @@ pub struct UploadTask {
     pub file_path: String,
     pub upload_type: String, // "log" or "artifact"
     pub s3_key: String,
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

@@ -22,8 +22,6 @@ use crate::models::{JobRegistry};
 use tokio::sync::RwLock;
 use std::collections::HashMap;
 use bollard::container::ListContainersOptions;
-use crate::db::sql_placeholder;
-
 const PORT: u16 = 3000;
 
 #[tokio::main]
@@ -104,9 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let (Some(id), Some(labels)) = (c.id, c.labels) {
                      if let Some(job_id) = labels.get("job_id") {
                          // Verify with DB
-                         let query = format!("SELECT status FROM jobs WHERE id = {}", sql_placeholder(1));
-                         if let Ok(Some((status,))) = sqlx::query_as::<_, (String,)>(&query)
-                            .bind(job_id)
+                         let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT status FROM jobs WHERE id = ");
+                         q_builder.push_bind(job_id);
+
+                         if let Ok(Some((status,))) = q_builder.build_query_as::< (String,) >()
                             .fetch_optional(&db_pool).await 
                          {
                              if status == "RUNNING" {
@@ -287,11 +286,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = tokio::fs::remove_file(path).await;
                                     },
                                     Err(e) => {
-                                        error!("❌ S3 Upload Failed: {}. Retrying later (TODO: Implement DLQ or Retry for Uploads)", e);
-                                        // For now, we don't delete the file so it might be picked up again if we had a retry mechanism.
-                                        // But here we just lose it from the queue. Ideally we push back.
-                                        // Let's re-enqueue with delay? Or just log error. 
-                                        // Current implementation: Log error and move on (File stays in /tmp until GC).
+                                        error!("❌ S3 Upload Failed: {}. (Attempt: {})", e, task.retry_count + 1);
+                                        let mut retry_task = task.clone();
+                                        retry_task.retry_count += 1;
+                                        
+                                        if retry_task.retry_count > 5 {
+                                             error!("❌ Upload exceeded max retries. Moving to DLQ.");
+                                             if let Err(dlq_err) = queue_for_upload.enqueue_upload_dlq(retry_task).await {
+                                                 error!("Failed to move upload task to DLQ: {}", dlq_err);
+                                             }
+                                        } else {
+                                             // Non-blocking Exponential Backoff via Tokio Task
+                                             let delay = 2u64.pow(retry_task.retry_count);
+                                             warn!("Retrying upload in {}s...", delay);
+                                             
+                                             let q_clone = queue_for_upload.clone();
+                                             tokio::spawn(async move {
+                                                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                                                 if let Err(re_err) = q_clone.enqueue_upload(retry_task).await {
+                                                      error!("Failed to re-enqueue upload task: {}", re_err);
+                                                 }
+                                             });
+                                        }
                                     }
                                 }
                             } else {

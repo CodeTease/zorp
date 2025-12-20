@@ -111,16 +111,3 @@ pub async fn init_pool() -> Result<DbPool, Box<dyn std::error::Error>> {
     }
 }
 
-// --- QUERY HELPER ---
-pub fn sql_placeholder(index: usize) -> String {
-    #[cfg(feature = "postgres")]
-    {
-        format!("${}", index)
-    }
-
-    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
-    {
-        let _ = index;
-        "?".to_string()
-    }
-}
