@@ -15,12 +15,15 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
+      
+      - name: Create .env
+        uses: cp .env.example .env
 
       - name: Build
         run: docker compose -f docker-compose.yml up -d --build --force-recreate
 
       - name: Test 
-        run: python3 test.py
+        run: pip install python-dotenv requests && python3 test.py
 
       - name: Clean up
         if: always()
