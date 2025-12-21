@@ -1,20 +1,19 @@
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
     StartContainerOptions, WaitContainerOptions, DownloadFromContainerOptions, ListContainersOptions,
-    StopContainerOptions, PruneContainersOptions,
+    StopContainerOptions,
 };
-use bollard::image::{CreateImageOptions, PruneImagesOptions};
-use bollard::volume::{PruneVolumesOptions, CreateVolumeOptions, ListVolumesOptions}; // Added CreateVolumeOptions, ListVolumesOptions
+use bollard::image::CreateImageOptions;
+use bollard::volume::{CreateVolumeOptions, ListVolumesOptions}; 
 use bollard::models::HostConfig;
-use bollard::system::EventsOptions;
 use bollard::Docker;
 use futures_util::TryStreamExt; 
 use futures_util::StreamExt;    
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, AsyncSeekExt, SeekFrom}; // Added AsyncSeekExt, SeekFrom
+use tokio::io::{AsyncWriteExt, AsyncSeekExt, SeekFrom}; 
 use tracing::{info, warn, error};
 use crate::models::{JobContext, JobRegistry, UploadTask};
 use crate::db::DbPool;
@@ -22,10 +21,8 @@ use crate::queue::JobQueue;
 use crate::metrics;
 use crate::streaming::RedisLogPublisher;
 use bollard::network::CreateNetworkOptions;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use hex;
 use uuid::Uuid;
+use crate::security;
 
 use aws_sdk_s3;
 
@@ -34,26 +31,11 @@ const ZORP_NETWORK_NAME: &str = "zorp-net";
 fn check_image_policy(image: &str) -> Result<(), String> {
     let allowed_images = std::env::var("ZORP_ALLOWED_IMAGES").unwrap_or_default();
     if allowed_images.is_empty() {
-        // If not set, allow all (or default strict? Prompt says "Image Whitelist")
-        // Prompt: "Cần làm: Thêm cơ chế Admission Controller: Image Whitelist/Regex"
-        // Let's assume strict by default if var is set, or relaxed if not? 
-        // "Trong src/engine.rs, Zorp nhận bất kỳ image nào... Cần làm: ... Image Whitelist"
-        // If the variable is missing, we should probably warn or block if we want to be secure.
-        // But for backward compatibility with existing envs, maybe default to "allow all" if unset, but strict if set.
-        // However, a secure default is better.
-        // Let's implement: If ZORP_ALLOWED_IMAGES is set, enforce it. If not, WARN but allow (or block?).
-        // The prompt implies current behavior is dangerous.
-        // I will log a warning if not set, but if set, enforce.
         return Ok(());
     }
     
-    // Simple comma separated list or regex? Prompt says "Whitelist/Regex".
-    // Let's try Regex if it starts with "regex:", otherwise exact match or prefix?
-    // Let's implement regex support.
-    
     use regex::Regex;
     
-    // Split by comma
     for pattern in allowed_images.split(',') {
         let pattern = pattern.trim();
         if pattern.is_empty() { continue; }
@@ -68,8 +50,6 @@ fn check_image_policy(image: &str) -> Result<(), String> {
                  warn!("Invalid regex policy: {}", re_str);
             }
         } else {
-            // Simple string match (or glob?)
-            // Let's do exact match or if it ends with *, prefix match
             if pattern.ends_with('*') {
                 let prefix = pattern.trim_end_matches('*');
                 if image.starts_with(prefix) {
@@ -84,7 +64,6 @@ fn check_image_policy(image: &str) -> Result<(), String> {
     Err(format!("Image '{}' is not allowed by ZORP_ALLOWED_IMAGES policy.", image))
 }
 
-// --- CANCEL JOB LOGIC ---
 pub async fn cancel_job(
     docker: &Docker,
     registry: &JobRegistry,
@@ -99,7 +78,6 @@ pub async fn cancel_job(
     if let Some(container_id) = container_name {
         info!("Cancellation requested for job {}. Stopping container {} (Grace period: 10s)...", job_id, container_id);
 
-        // Graceful Cancellation: Stop container with timeout (SIGTERM -> SIGKILL)
         let stop_opts = StopContainerOptions { t: 10 }; 
         match docker.stop_container(&container_id, Some(stop_opts)).await {
             Ok(_) => {
@@ -107,14 +85,12 @@ pub async fn cancel_job(
             }
             Err(e) => {
                 warn!("Failed to gracefully stop container {}: {}. Attempting forced kill...", container_id, e);
-                // Fallback to kill if stop fails (e.g. timeout or error)
                 if let Err(k_e) = docker.kill_container::<String>(&container_id, None).await {
                      warn!("Failed to kill container {}: {}", container_id, k_e);
                 }
             }
         }
 
-        // Update DB status to CANCELLED
         let mut q_builder = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'CANCELLED' WHERE id = ");
         q_builder.push_bind(job_id);
 
@@ -125,224 +101,8 @@ pub async fn cancel_job(
         return Ok(true);
     }
 
-    // Fallback: Check if it's in DB as RUNNING but not in registry (Zombie?)
-    // Or maybe just return false saying "Job not found running".
     warn!("Cancellation requested for job {}, but it was not found in active registry.", job_id);
     Ok(false)
-}
-
-// --- THE ZOMBIE REAPER & GARBAGE COLLECTOR ---
-pub fn spawn_reaper_task(docker: Docker, db: DbPool, registry: JobRegistry) {
-    // 1. Event Stream Listener (Real-time)
-    let docker_events = docker.clone();
-    let db_events = db.clone();
-    
-    tokio::spawn(async move {
-        info!("👂 Docker Event Listener started.");
-        let mut filters = std::collections::HashMap::new();
-        filters.insert("type".to_string(), vec!["container".to_string()]);
-        filters.insert("event".to_string(), vec!["die".to_string()]);
-        filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
-
-        let options = EventsOptions {
-            filters,
-            ..Default::default()
-        };
-
-        let mut stream = docker_events.events(Some(options));
-
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(event) => {
-                    if let Some(actor) = event.actor {
-                        if let Some(attributes) = actor.attributes {
-                            if let Some(job_id) = attributes.get("job_id") {
-                                info!("⚡ Event Listener: Detected death of job container {}", job_id);
-                                
-                                // Immediate status update
-                                let mut q_select = sqlx::query_builder::QueryBuilder::new("SELECT status FROM jobs WHERE id = ");
-                                q_select.push_bind(job_id);
-                                
-                                let row = q_select.build_query_as::< (String,) >()
-                                    .fetch_optional(&db_events).await;
-
-                                if let Ok(Some((status,))) = row {
-                                    if status == "RUNNING" {
-                                        warn!("⚡ Event Listener: Job {} died unexpectedly. Updating DB...", job_id);
-                                        
-                                        let mut q_update = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'FAILED', exit_code = -999 WHERE id = ");
-                                        q_update.push_bind(job_id);
-                                        
-                                        let _ = q_update.build().execute(&db_events).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error in Docker event stream: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            }
-        }
-    });
-
-    // 2. Fallback Poller (Every 60s)
-    tokio::spawn(async move {
-        info!("逐 Zombie Reaper & Garbage Collector task started.");
-        loop {
-            // Reap Zombies (every 60s)
-            reap_zombies(&docker, &db).await;
-            
-            // Garbage Collection (Temp files & Pruning)
-            garbage_collection(&docker, &registry).await;
-
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        }
-    });
-}
-
-async fn reap_zombies(docker: &Docker, db: &DbPool) {
-    let mut filters = std::collections::HashMap::new();
-    filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
-
-    let options = ListContainersOptions {
-        all: true,
-        filters,
-        ..Default::default()
-    };
-
-    if let Ok(containers) = docker.list_containers(Some(options)).await {
-        for c in containers {
-            let job_id = c.labels.as_ref()
-                .and_then(|l| l.get("job_id"))
-                .cloned();
-
-            // Check if it's a DEBUG container
-            let is_debug = c.labels.as_ref()
-                .and_then(|l| l.get("zorp_debug"))
-                .map(|v| v == "true")
-                .unwrap_or(false);
-
-            if let Some(jid) = job_id {
-                 let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT status FROM jobs WHERE id = ");
-                 q_builder.push_bind(&jid);
-                 
-                 let row = q_builder.build_query_as::< (String,) >()
-                     .fetch_optional(db).await;
-
-                 let should_kill = match row {
-                     Ok(Some((status,))) => status != "RUNNING" && status != "QUEUED",
-                     Ok(None) => true, // Job not in DB? Zombie.
-                     Err(_) => false,
-                 };
-
-                 if should_kill {
-                     // If it is DEBUG, we don't kill it immediately here. 
-                     // Garbage collection will handle it based on TTL.
-                     // But if it is actively running and marked as finished in DB, we SHOULD stop it.
-                     if c.state.as_deref() == Some("running") {
-                         warn!("逐 Reaper: Found active zombie {} (Job {}). Terminating...", c.id.as_deref().unwrap_or("?"), jid);
-                         if let Some(id) = c.id.as_ref() {
-                            let _ = docker.kill_container::<String>(id, None).await;
-                         }
-                     }
-                     
-                     // Removal: Only if NOT debug. Debug containers stay until GC.
-                     if !is_debug {
-                         if let Some(id) = c.id.as_ref() {
-                            let _ = docker.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
-                         }
-                     }
-                 }
-            }
-        }
-    }
-}
-
-async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
-    info!("🧹 Running Garbage Collection & Pruning...");
-    // 1. Clean up stale /tmp files (logs & artifacts) older than 1 hour
-    let tmp_dir = std::path::Path::new("/tmp");
-    if let Ok(mut entries) = tokio::fs::read_dir(tmp_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("zorp-") {
-                    // Extract ID from zorp-{id}.log or zorp-artifacts-{id}.tar
-                    let job_id = if name.starts_with("zorp-artifacts-") {
-                        name.trim_start_matches("zorp-artifacts-").trim_end_matches(".tar")
-                    } else {
-                        name.trim_start_matches("zorp-").trim_end_matches(".log")
-                    };
-
-                    // Check if job is still running
-                    if registry.read().await.contains_key(job_id) {
-                         // Job is running, SKIP deletion even if old (long running job)
-                         continue;
-                    }
-
-                    if let Ok(metadata) = entry.metadata().await {
-                        if let Ok(modified) = metadata.modified() {
-                            if let Ok(age) = SystemTime::now().duration_since(modified) {
-                                if age > std::time::Duration::from_secs(3600) {
-                                    info!("🧹 GC: Removing stale file {:?}", path);
-                                    let _ = tokio::fs::remove_file(path).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Clean up Debug Containers (> 30 mins)
-    let mut filters = std::collections::HashMap::new();
-    filters.insert("label".to_string(), vec!["zorp_debug=true".to_string()]);
-    
-    let options = ListContainersOptions {
-        all: true,
-        filters: filters.clone(),
-        ..Default::default()
-    };
-
-    if let Ok(containers) = docker.list_containers(Some(options)).await {
-        for c in containers {
-             if let Some(created) = c.created {
-                 // Docker timestamp is usually unix timestamp
-                 let created_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(created as u64);
-                 if let Ok(age) = SystemTime::now().duration_since(created_time) {
-                     if age > std::time::Duration::from_secs(1800) { // 30 mins
-                         if let Some(id) = c.id {
-                             info!("🧹 GC: Removing expired debug container {}", id);
-                             let _ = docker.remove_container(&id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
-                         }
-                     }
-                 }
-             }
-        }
-    }
-
-    // 3. Prune Docker Resources
-    let mut filters = std::collections::HashMap::new();
-    filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
-    
-    // Prune containers (Only stopped ones that are not debug and not recent)
-    // Actually prune_containers is aggressive. We should rely on auto-remove or explicit remove.
-    // The previous implementation used prune which might be too broad if we want to keep debug ones.
-    // But we filtered by label managed_by=zorp. 
-    // We should probably filter out zorp_debug=true for pruning.
-    // Unfortunately bollard/docker prune filters are limited (label=key=value).
-    // So we'll skip global prune for now to protect debug containers, relying on explicit removal in dispatch and reap_zombies.
-    // let _ = docker.prune_containers(Some(PruneContainersOptions { filters: filters.clone() })).await;
-
-    // Prune images (dangling)
-    let _ = docker.prune_images(Some(PruneImagesOptions::<String> { filters: std::collections::HashMap::new() })).await; 
-    
-    // Prune volumes
-    let _ = docker.prune_volumes(Some(PruneVolumesOptions::<String> { filters: std::collections::HashMap::new() })).await;
 }
 
 // --- DISPATCHER LOGIC ---
@@ -926,15 +686,11 @@ impl Dispatcher {
                 // SIGNATURE GENERATION
                 let mut headers = reqwest::header::HeaderMap::new();
                 if let Ok(payload_str) = serde_json::to_string(&payload) {
-                     type HmacSha256 = Hmac<Sha256>;
-                     if let Ok(mut mac) = HmacSha256::new_from_slice(secret_key.as_bytes()) {
-                         mac.update(payload_str.as_bytes());
-                         let result = mac.finalize();
-                         let signature = hex::encode(result.into_bytes());
+                    if let Some(signature) = security::sign_payload(&secret_key, &payload_str) {
                          if let Ok(hv) = reqwest::header::HeaderValue::from_str(&signature) {
                              headers.insert("X-Zorp-Signature", hv);
                          }
-                     }
+                    }
                 }
 
                 let send_result = http_client.post(&url)
