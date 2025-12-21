@@ -262,6 +262,7 @@ async fn reap_zombies(docker: &Docker, db: &DbPool) {
 }
 
 async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
+    info!("🧹 Running Garbage Collection & Pruning...");
     // 1. Clean up stale /tmp files (logs & artifacts) older than 1 hour
     let tmp_dir = std::path::Path::new("/tmp");
     if let Ok(mut entries) = tokio::fs::read_dir(tmp_dir).await {
@@ -475,6 +476,8 @@ impl Dispatcher {
                  req_cpu_cores = max_cpu_cores;
             }
 
+            info!("[{}] Enforcing Resource Limits: Mem={}MB, CPU={}", job.id, req_mem_mb, req_cpu_cores);
+
             let memory = req_mem_mb * 1024 * 1024;
             let cpu_quota = (req_cpu_cores * 100000.0) as i64;
 
@@ -488,8 +491,21 @@ impl Dispatcher {
                 }).await;
             }
 
-            // Image Policy Check
-            if let Err(policy_err) = check_image_policy(&job.image) {
+            // Input Validation & Policy Check
+            let mut validation_error = None;
+            if let Some(url) = &job.callback_url {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                     validation_error = Some("Callback URL must start with http:// or https://".to_string());
+                }
+            }
+
+            if let Some(err) = validation_error {
+                 error!("[{}] Input Validation Failed: {}", job.id, err);
+                 let _ = log_publisher.publish(&job.id, &format!("ERROR: Input Validation Failed: {}\n", err)).await;
+                 final_status = "FAILED";
+                 final_exit_code = -1;
+                 webhook_logs = format!("Security Error: {}", err);
+            } else if let Err(policy_err) = check_image_policy(&job.image) {
                  error!("[{}] Image Policy Violation: {}", job.id, policy_err);
                  let _ = log_publisher.publish(&job.id, &format!("ERROR: Image Policy Violation: {}\n", policy_err)).await;
                  final_status = "FAILED";
@@ -556,7 +572,9 @@ impl Dispatcher {
                         // Security Context
                         readonly_rootfs: Some(true),
                         cap_drop: Some(vec!["ALL".to_string()]),
-                        pids_limit: Some(100),
+                        pids_limit: Some(std::env::var("ZORP_PIDS_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(100)),
+                        // Tini init for proper signal handling (PID 1 zombie reaping)
+                        init: Some(true),
                         // Network Isolation
                         network_mode: Some(ZORP_NETWORK_NAME.to_string()),
                         // Extra Hosts: Block metadata service

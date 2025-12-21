@@ -30,7 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     dotenv().ok();
-    tracing_subscriber::fmt::init();
+
+    if env::var("ZORP_LOG_FORMAT").unwrap_or_default().to_lowercase() == "json" {
+        tracing_subscriber::fmt().json().init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
 
     let secret_key = env::var("ZORP_SECRET_KEY")
         .map_err(|_| {
@@ -184,43 +189,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         queue.clone(),
     ));
 
-    // 6. Spawn WORKER THREAD (with Graceful Shutdown support)
-    let queue_for_worker = queue.clone();
-    let dispatcher_for_worker = dispatcher.clone();
+    // 6. Spawn WORKER THREADS (with Graceful Shutdown support)
     let (shutdown_tx, mut _shutdown_rx) = tokio::sync::broadcast::channel(1); // Fixed unused warning
-    
-    let worker_shutdown_rx = shutdown_tx.subscribe();
     let upload_worker_shutdown_rx = shutdown_tx.subscribe();
 
-    // MAIN JOB WORKER
-    let worker_handle = tokio::spawn(async move {
-        info!("👷 Worker thread started.");
-        let mut shutdown = worker_shutdown_rx;
-        loop {
-            tokio::select! {
-                _ = shutdown.recv() => {
-                    info!("👷 Worker thread stopping (stop accepting new jobs)...");
-                    break;
-                }
-                job = queue_for_worker.dequeue() => {
-                    match job {
-                        Ok(Some(job)) => {
-                            info!("📥 Worker picked up job: {}", job.id);
-                            dispatcher_for_worker.dispatch(job).await; 
-                        }
-                        Ok(None) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(e) => {
-                            error!("❌ Queue Error: {}. Retrying in 5s...", e);
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let worker_count: usize = env::var("ZORP_WORKER_COUNT")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse()
+        .unwrap_or(1);
+    
+    info!("🚀 Spawning {} worker threads...", worker_count);
+
+    let mut worker_handles = Vec::new();
+
+    for i in 0..worker_count {
+        let queue_for_worker = queue.clone();
+        let dispatcher_for_worker = dispatcher.clone();
+        let mut shutdown = shutdown_tx.subscribe();
+        
+        let handle = tokio::spawn(async move {
+            info!("👷 Worker #{} thread started.", i + 1);
+            loop {
+                tokio::select! {
+                    _ = shutdown.recv() => {
+                        info!("👷 Worker #{} thread stopping...", i + 1);
+                        break;
+                    }
+                    job = queue_for_worker.dequeue() => {
+                        match job {
+                            Ok(Some(job)) => {
+                                info!("📥 Worker #{} picked up job: {}", i + 1, job.id);
+                                dispatcher_for_worker.dispatch(job).await; 
+                            }
+                            Ok(None) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            Err(e) => {
+                                error!("❌ Queue Error (Worker #{}): {}. Retrying in 5s...", i + 1, e);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
                         }
                     }
                 }
             }
-        }
-        info!("👷 Worker thread stopped.");
-    });
+            info!("👷 Worker #{} thread stopped.", i + 1);
+        });
+        worker_handles.push(handle);
+    }
 
     // UPLOAD WORKER (S3 DECOUPLING)
     let queue_for_upload = queue.clone();
@@ -375,8 +390,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = shutdown_tx.send(());
 
             // --- GRACEFUL SHUTDOWN DRAIN LOGIC ---
-            info!("⏳ Waiting for worker thread to stop...");
-            let _ = worker_handle.await;
+            info!("⏳ Waiting for worker threads to stop...");
+            for handle in worker_handles {
+                let _ = handle.await;
+            }
 
             info!("⏳ Draining active jobs...");
             let drain_timeout = std::time::Duration::from_secs(60); // 60s hard timeout

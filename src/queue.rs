@@ -263,6 +263,7 @@ impl JobQueue for RedisQueue {
     }
 
     async fn monitor_stranded_jobs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        info!("❤️  Monitor: Checking for stranded jobs (Heartbeat Check)...");
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 

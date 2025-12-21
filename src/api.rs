@@ -1,9 +1,9 @@
 use axum::{
-    async_trait,
     extract::{FromRequestParts, Path, State, Json, Query},
     http::{header, request::Parts, StatusCode},
     routing::{get, post, delete},
     Router,
+    middleware,
 };
 use axum::response::{IntoResponse, Response}; 
 use axum::response::sse::{Event, Sse};
@@ -27,6 +27,8 @@ use aws_sdk_s3;
 use axum::body::Body;
 use std::convert::Infallible;
 
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+
 // --- SHARED STATE ---
 pub struct AppState {
     pub db: DbPool,
@@ -49,7 +51,6 @@ pub struct AuthContext {
 // --- AUTH MIDDLEWARE ---
 struct Auth(AuthContext);
 
-#[async_trait]
 impl FromRequestParts<Arc<AppState>> for Auth {
     type Rejection = (StatusCode, &'static str);
     async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
@@ -327,26 +328,44 @@ async fn handle_get_job_logs(
 }
 
 // --- SSE LOG STREAMING ---
+#[derive(Deserialize)]
+struct StreamLogsQuery {
+    last_id: Option<String>,
+}
+
 async fn handle_stream_logs(
     State(_state): State<Arc<AppState>>, // Added underscore
     Path(job_id): Path<String>,
+    Query(query): Query<StreamLogsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    info!("Client connected to stream logs for job: {}", job_id);
+    info!("Client connected to stream logs for job: {} (Resume: {:?})", job_id, query.last_id);
 
     // Redis Subscriber
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let publisher = RedisLogPublisher::new(&redis_url);
 
     let stream = async_stream::stream! {
-        match publisher.subscribe(&job_id).await {
-            Ok(mut rx) => {
-                 while let Some(msg) = rx.next().await {
-                     yield Ok(Event::default().data(msg));
+        match publisher.subscribe(&job_id, query.last_id).await {
+            Ok(rx) => {
+                 // Pin the stream
+                 let mut pinned_rx = Box::pin(rx);
+                 while let Some(res) = pinned_rx.next().await {
+                     match res {
+                         Ok((id, msg)) => {
+                             yield Ok(Event::default()
+                                .id(id)
+                                .data(msg));
+                         }
+                         Err(e) => {
+                             error!("Error in log stream for {}: {}", job_id, e);
+                             break;
+                         }
+                     }
                  }
-                 yield Ok(Event::default().data("[Stream Ended: Redis Connection Closed]"));
+                 yield Ok(Event::default().data("[Stream Ended]"));
             },
             Err(e) => {
-                error!("Failed to subscribe to redis log channel for {}: {}", job_id, e);
+                error!("Failed to subscribe to redis log stream for {}: {}", job_id, e);
                 yield Ok(Event::default().data("[Error: Failed to connect to log stream]"));
             }
         }
@@ -397,6 +416,17 @@ async fn handle_list_jobs(
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
+    // Rate Limiting: Allow 10 requests per second with a burst of 20
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(10)
+            .burst_size(20)
+            .finish()
+            .unwrap(),
+    );
+
+    let rate_limit_layer = GovernorLayer::new(governor_conf);
+
     Router::new()
         .route("/", get(health_check))
         .route("/healthz", get(handle_healthz))
@@ -406,5 +436,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/job/:id/logs", get(handle_get_job_logs))
         .route("/job/:id/stream", get(handle_stream_logs))
         .route("/jobs", get(handle_list_jobs))
+        .layer(rate_limit_layer)
         .with_state(state)
 }
