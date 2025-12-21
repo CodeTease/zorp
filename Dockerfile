@@ -1,5 +1,5 @@
 # Builder Stage
-FROM rust:1.81-bookworm as builder
+FROM rust:1.92-bookworm as builder
 
 WORKDIR /app
 
