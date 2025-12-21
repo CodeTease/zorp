@@ -1,0 +1,99 @@
+services:
+  zorp:
+    build: .
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount Docker Socket for Zorp to spawn sibling containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    environment:
+      # Database
+      - DATABASE_URL=postgres://zorp:zorp_password@postgres:5432/zorp
+      - ZORP_DB_MAX_CONNS=20
+      - ZORP_DB_MIN_CONNS=5
+      - ZORP_DB_TIMEOUT=30
+      
+      # Redis
+      - REDIS_URL=redis://redis:6379
+      
+      # Application
+      - ZORP_SECRET_KEY=change_me_in_production_secret_key_12345
+      - ZORP_MAX_JOBS=10
+      - ZORP_WORKER_COUNT=2
+      - ZORP_LOG_FORMAT=json
+      
+      # S3 (MinIO)
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_REGION=us-east-1
+      - S3_BUCKET_NAME=zorp-artifacts
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_FORCE_PATH_STYLE=true
+
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: zorp
+      POSTGRES_PASSWORD: zorp_password
+      POSTGRES_DB: zorp
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zorp"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Optional: Setup bucket automatically
+  minio-create-bucket:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/zorp-artifacts;
+      /usr/bin/mc anonymous set public myminio/zorp-artifacts;
+      exit 0;
+      "
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
