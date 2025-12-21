@@ -17,7 +17,7 @@ jobs:
         uses: docker/setup-buildx-action@v2
       
       - name: Create .env
-        uses: cp .env.example .env
+        run: cp .env.example .env
 
       - name: Build
         run: docker compose -f docker-compose.yml up -d --build --force-recreate
