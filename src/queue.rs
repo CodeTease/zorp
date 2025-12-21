@@ -19,6 +19,12 @@ pub trait JobQueue: Send + Sync {
     async fn enqueue_upload(&self, task: UploadTask) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn enqueue_upload_dlq(&self, task: UploadTask) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     async fn dequeue_upload(&self) -> Result<Option<UploadTask>, Box<dyn std::error::Error + Send + Sync>>;
+
+    // Webhook Queue
+    async fn enqueue_webhook(&self, payload: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn enqueue_webhook_retry(&self, payload: String, delay_seconds: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn dequeue_webhook(&self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn monitor_webhook_retries(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 // --- REDIS IMPLEMENTATION ---
@@ -29,6 +35,8 @@ pub struct RedisQueue {
     queue_low: String,
     processing_queue_name: String,
     upload_queue_name: String,
+    webhook_queue_name: String,
+    webhook_retry_zset: String,
 }
 
 impl RedisQueue {
@@ -41,6 +49,8 @@ impl RedisQueue {
             queue_low: "zorp_jobs_low".to_string(),
             processing_queue_name: "zorp_jobs:processing".to_string(),
             upload_queue_name: "zorp_uploads".to_string(),
+            webhook_queue_name: "zorp:webhooks:pending".to_string(),
+            webhook_retry_zset: "zorp:webhooks:retry".to_string(),
         }
     }
 
@@ -412,5 +422,63 @@ impl JobQueue for RedisQueue {
         } else {
              Ok(None)
         }
+    }
+
+    async fn enqueue_webhook(&self, payload: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let _: () = conn.lpush(&self.webhook_queue_name, payload).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok(())
+    }
+
+    async fn enqueue_webhook_retry(&self, payload: String, delay_seconds: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        let score = chrono::Utc::now().timestamp() + delay_seconds;
+        let _: () = conn.zadd(&self.webhook_retry_zset, payload, score).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok(())
+    }
+
+    async fn dequeue_webhook(&self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let result: Option<(String, String)> = conn.brpop(&self.webhook_queue_name, 1.0).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        if let Some((_, payload)) = result {
+            Ok(Some(payload))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn monitor_webhook_retries(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let now = chrono::Utc::now().timestamp();
+        
+        // 1. Get ready items
+        let items: Vec<String> = conn.zrangebyscore(&self.webhook_retry_zset, "-inf", now).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            
+        let mut count = 0;
+        for item in items {
+            // 2. Move to Pending List
+            let _: () = conn.lpush(&self.webhook_queue_name, &item).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                
+            // 3. Remove from ZSET
+            let _: () = conn.zrem(&self.webhook_retry_zset, &item).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            count += 1;
+        }
+        
+        Ok(count)
     }
 }

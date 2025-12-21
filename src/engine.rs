@@ -23,6 +23,7 @@ use crate::streaming::RedisLogPublisher;
 use bollard::network::CreateNetworkOptions;
 use uuid::Uuid;
 use crate::security;
+use crate::cache;
 
 use aws_sdk_s3;
 
@@ -252,6 +253,37 @@ impl Dispatcher {
             }
 
             // Input Validation & Policy Check
+            // --- HOT VOLUMES (CACHING) ---
+            // Move cache logic OUTSIDE of validation/image check blocks to ensure it scopes correctly for later use
+            let mut binds = Vec::new();
+            let host_cache_path = if let Some(cache_key) = &job.cache_key {
+                let path = std::path::PathBuf::from(format!("/tmp/zorp-cache/{}", cache_key));
+                
+                // Restore Cache from S3
+                if let (Some(s3_client), Some(bucket)) = (&s3_client, &s3_bucket) {
+                    if let Err(e) = cache::restore_cache(s3_client, bucket, cache_key, &path).await {
+                        warn!("[{}] Failed to restore cache: {}", job.id, e);
+                    } else {
+                        info!("[{}] Cache restored successfully.", job.id);
+                    }
+                }
+
+                // Create dir if not exists (in case S3 restore failed or was empty)
+                if !path.exists() {
+                        let _ = tokio::fs::create_dir_all(&path).await;
+                }
+
+                if let Some(paths) = &job.cache_paths {
+                    for container_path in paths {
+                        // Use Bind Mount from Host Path
+                        binds.push(format!("{}:{}", path.to_string_lossy(), container_path));
+                    }
+                }
+                Some(path)
+            } else {
+                None
+            };
+            
             let mut validation_error = None;
             if let Some(url) = &job.callback_url {
                 if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -283,41 +315,6 @@ impl Dispatcher {
                 labels.insert("job_id".to_string(), job.id.clone());
                 if job.debug {
                     labels.insert("zorp_debug".to_string(), "true".to_string());
-                }
-
-                // --- HOT VOLUMES (CACHING) ---
-                let mut binds = Vec::new();
-                if let Some(cache_key) = &job.cache_key {
-                    let volume_name = format!("zorp-cache-{}", cache_key);
-                    
-                    // Check if volume exists, if not create it
-                    let mut filters = std::collections::HashMap::new();
-                    filters.insert("name".to_string(), vec![volume_name.clone()]);
-                    let list_opts = ListVolumesOptions { filters };
-                    
-                    let exists = match docker.list_volumes(Some(list_opts)).await {
-                         Ok(res) => res.volumes.map(|v| !v.is_empty()).unwrap_or(false),
-                         Err(_) => false,
-                    };
-
-                    if !exists {
-                         let create_opts = CreateVolumeOptions {
-                             name: volume_name.clone(),
-                             labels: labels.clone(), // Tag volume with same labels (managed_by=zorp)
-                             ..Default::default()
-                         };
-                         if let Err(e) = docker.create_volume(create_opts).await {
-                             warn!("[{}] Failed to create cache volume {}: {}", job.id, volume_name, e);
-                         } else {
-                             info!("[{}] Created cache volume: {}", job.id, volume_name);
-                         }
-                    }
-
-                    if let Some(paths) = &job.cache_paths {
-                        for path in paths {
-                            binds.push(format!("{}:{}", volume_name, path));
-                        }
-                    }
                 }
 
                 let config = Config {
@@ -526,6 +523,21 @@ impl Dispatcher {
                  final_status = "FAILED";
             }
 
+            // --- SAVE CACHE ---
+            if let (Some(host_path), Some(cache_key)) = (host_cache_path, &job.cache_key) {
+                if final_status != "FAILED" && final_status != "TIMED_OUT" && final_status != "CANCELLED" {
+                    if let (Some(s3_client), Some(bucket)) = (&s3_client, &s3_bucket) {
+                         if let Err(e) = cache::save_cache(s3_client, bucket, cache_key, &host_path).await {
+                             warn!("[{}] Failed to save cache: {}", job.id, e);
+                         } else {
+                             info!("[{}] Cache saved successfully.", job.id);
+                         }
+                    }
+                }
+                // Cleanup local cache dir to save space
+                let _ = tokio::fs::remove_dir_all(&host_path).await;
+            }
+
             // --- JOB CHAINING (DAG) ---
             if final_exit_code == 0 && final_status != "FAILED" && final_status != "TIMED_OUT" && final_status != "CANCELLED" {
                 if !job.on_success.is_empty() {
@@ -675,39 +687,22 @@ impl Dispatcher {
             }
 
             if let Some(url) = job.callback_url {
-                let payload = serde_json::json!({
+                // Use the new Webhook Queue instead of direct call
+                let webhook_payload = serde_json::json!({
                     "job_id": job.id,
                     "status": final_status,
                     "exit_code": final_exit_code,
                     "duration_seconds": duration,
-                    "logs": webhook_logs
+                    "logs": webhook_logs,
+                    "callback_url": url,
+                    "attempt": 0
                 });
 
-                // SIGNATURE GENERATION
-                let mut headers = reqwest::header::HeaderMap::new();
-                if let Ok(payload_str) = serde_json::to_string(&payload) {
-                    if let Some(signature) = security::sign_payload(&secret_key, &payload_str) {
-                         if let Ok(hv) = reqwest::header::HeaderValue::from_str(&signature) {
-                             headers.insert("X-Zorp-Signature", hv);
-                         }
+                if let Ok(json_str) = serde_json::to_string(&webhook_payload) {
+                    info!("[{}] Enqueuing webhook callback...", job.id);
+                    if let Err(e) = queue.enqueue_webhook(json_str).await {
+                        error!("[{}] Failed to enqueue webhook: {}", job.id, e);
                     }
-                }
-
-                let send_result = http_client.post(&url)
-                    .headers(headers.clone())
-                    .json(&payload)
-                    .send()
-                    .await;
-                
-                if let Err(e) = send_result {
-                     warn!("[{}] Webhook failed (1/2): {}. Retrying...", job.id, e);
-                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                     let _ = http_client.post(&url)
-                         .headers(headers)
-                         .json(&payload)
-                         .send()
-                         .await
-                         .map_err(|e2| error!("[{}] Webhook failed (2/2): {}", job.id, e2));
                 }
             }
         });
