@@ -12,8 +12,10 @@ use crate::queue::RedisQueue;
 use std::sync::Arc;
 use redis::AsyncCommands;
 use uuid::Uuid;
+use crate::models::JobContext;
+use crate::queue::JobQueue;
 
-pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, _queue: Arc<RedisQueue>, s3_client: aws_sdk_s3::Client, s3_bucket: String) -> tokio::task::JoinHandle<()> {
+pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, queue: Arc<RedisQueue>, s3_client: aws_sdk_s3::Client, s3_bucket: String) -> tokio::task::JoinHandle<()> {
     // 1. Event Stream Listener (Real-time) - Keeps running independently?
     // The prompt says "Chia để trị Leader Election... Chỉ ông nào nắm giữ khóa Redis mới được quyền chạy task dọn dẹp hệ thống."
     // This usually implies the periodic reaper, not necessarily the event listener which is local to the instance's docker daemon.
@@ -132,6 +134,9 @@ pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, _queue: Arc<Redi
 
                     // Retention Policy (New Feature)
                     cleanup_old_jobs(&db, &s3_client, &s3_bucket).await;
+
+                    // Requeue Stuck Jobs (Distributed Transaction Recovery)
+                    requeue_stuck_jobs(&db, &queue).await;
                 }
                 _ => {
                     // Not leader, just skip
@@ -142,6 +147,68 @@ pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, _queue: Arc<Redi
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     })
+}
+
+async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
+    // Distributed Transaction Recovery:
+    // If a job is persisted to DB as 'QUEUED' but fails to push to Redis (or Redis crashes),
+    // it will remain 'QUEUED' forever (Orphan Job).
+    // We scan for jobs that have been 'QUEUED' for > 5 minutes and are not running.
+
+    let query = if cfg!(feature = "postgres") {
+        "SELECT id, image, commands, callback_url, user_id FROM jobs WHERE status = 'QUEUED' AND created_at < NOW() - INTERVAL '5 minutes'"
+    } else {
+        "SELECT id, image, commands, callback_url, user_id FROM jobs WHERE status = 'QUEUED' AND created_at < date('now', '-5 minutes')"
+    };
+
+    // Using a struct that matches the query columns for sqlx::FromRow
+    #[derive(sqlx::FromRow)]
+    struct StuckJob {
+        id: String,
+        image: String,
+        commands: String, // JSON string
+        callback_url: Option<String>,
+        user_id: Option<String>,
+    }
+
+    let rows: Result<Vec<StuckJob>, _> = sqlx::query_as(query).fetch_all(db).await;
+
+    match rows {
+        Ok(jobs) => {
+            if jobs.is_empty() { return; }
+            warn!("⚠️  Reaper found {} stuck/orphan jobs (QUEUED > 5m). Attempting to re-enqueue...", jobs.len());
+
+            for job in jobs {
+                let commands_vec: Vec<String> = serde_json::from_str(&job.commands).unwrap_or_default();
+                
+                let context = JobContext {
+                    id: job.id.clone(),
+                    image: job.image,
+                    commands: commands_vec,
+                    env: None, // Lost if not in DB
+                    limits: None, // Lost if not in DB
+                    callback_url: job.callback_url,
+                    timeout_seconds: None, // Lost
+                    artifacts_path: None, // Lost
+                    user: job.user_id,
+                    cache_key: None, // Lost
+                    cache_paths: None, // Lost
+                    on_success: vec![], // Lost
+                    debug: false,
+                    priority: None,
+                    retry_count: 0,
+                };
+
+                info!("♻️  Re-enqueuing stuck job: {}", context.id);
+                if let Err(e) = queue.enqueue(context).await {
+                    error!("Failed to re-enqueue job {}: {}", job.id, e);
+                }
+            }
+        },
+        Err(e) => {
+             error!("Failed to query stuck jobs: {}", e);
+        }
+    }
 }
 
 async fn cleanup_old_jobs(db: &DbPool, s3: &aws_sdk_s3::Client, bucket: &str) {

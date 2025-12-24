@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use chrono::{DateTime, Utc};
+use validator::Validate;
 
 // --- DATA STRUCTURES ---
 
@@ -14,9 +15,11 @@ pub struct JobLimits {
     pub cpu_cores: Option<f32>,
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
+#[derive(Debug, Deserialize, Clone, Serialize, Validate)]
 pub struct JobRequest {
+    #[validate(length(min = 1, message = "Image name cannot be empty"))]
     pub image: String,
+    #[validate(length(min = 1, max = 100, message = "Commands list must be between 1 and 100 items"))]
     pub commands: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub limits: Option<JobLimits>,

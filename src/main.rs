@@ -11,6 +11,8 @@ mod streaming;
 mod infrastructure;
 mod workers;
 mod security;
+mod cache;
+mod scheduler;
 
 use dotenvy::dotenv;
 use std::env;
@@ -78,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dispatcher = Arc::new(engine::Dispatcher::new(
         infra.docker.clone(),
         infra.db_pool.clone(),
-        http_client,
+        http_client.clone(),
         max_jobs,
         infra.job_registry.clone(),
         infra.s3_client.clone(),
@@ -90,6 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Spawn WORKER THREADS (with Graceful Shutdown support)
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
     let upload_worker_shutdown_rx = shutdown_tx.subscribe();
+    let webhook_worker_shutdown_rx = shutdown_tx.subscribe();
+    let scheduler_shutdown_rx = shutdown_tx.subscribe();
 
     let worker_count: usize = env::var("ZORP_WORKER_COUNT")
         .unwrap_or_else(|_| "1".to_string())
@@ -144,10 +148,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         upload_worker_shutdown_rx
     );
 
+    // 5b. Webhook Worker
+    workers::webhook::spawn(
+        infra.queue.clone(),
+        http_client.clone(),
+        secret_key.clone(),
+        webhook_worker_shutdown_rx
+    );
+
+    // 5c. Cron Scheduler
+    let scheduler_db = infra.db_pool.clone();
+    let scheduler_queue = infra.queue.clone();
+    tokio::spawn(async move {
+        scheduler::spawn(
+            scheduler_db,
+            scheduler_queue,
+            scheduler_shutdown_rx
+        ).await;
+    });
+
     // 6. Setup App State
     let state = Arc::new(api::AppState {
         db: infra.db_pool.clone(),
-        queue: infra.queue,
+        queue: infra.queue.clone(),
         secret_key,
         docker: infra.docker,
         job_registry: infra.job_registry,
@@ -157,7 +180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Start Server with Graceful Shutdown
     let app = api::create_router(state);
-    let port = PORT; // Use const from existing or just 3000
+    let port = env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Server listening on http://{}", addr);
 
@@ -223,5 +249,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("👋 Zorp shutdown complete.");
     Ok(())
 }
-
-const PORT: u16 = 3000;

@@ -28,6 +28,7 @@ use axum::body::Body;
 use std::convert::Infallible;
 
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use validator::Validate;
 
 // --- SHARED STATE ---
 pub struct AppState {
@@ -153,6 +154,14 @@ async fn handle_dispatch(
     Auth(auth): Auth,
     Json(payload): Json<JobRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Input Validation
+    if let Err(e) = payload.validate() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Validation failed", 
+            "details": format!("{:?}", e)
+        })));
+    }
+
     // RBAC Check
     if auth.role != "admin" && !auth.permissions.contains(&"dispatch".to_string()) && !auth.permissions.contains(&"*".to_string()) {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Insufficient permissions"})));
@@ -267,7 +276,15 @@ async fn handle_get_job(
         .fetch_optional(&state.db).await;
 
     match row {
-        Ok(Some(job)) => (StatusCode::OK, Json(serde_json::to_value(job).unwrap_or_default())),
+        Ok(Some(job)) => {
+            match serde_json::to_value(job) {
+                Ok(val) => (StatusCode::OK, Json(val)),
+                Err(e) => {
+                    error!("Serialization error in get_job: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal serialization error"})))
+                }
+            }
+        },
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Job not found"}))),
         Err(e) => {
             error!("DB error get_job: {}", e);
