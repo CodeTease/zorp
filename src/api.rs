@@ -200,6 +200,7 @@ async fn handle_dispatch(
                 user: user_id,
                 cache_key: payload.cache_key,
                 cache_paths: payload.cache_paths,
+                services: payload.services,
                 on_success: payload.on_success,
                 debug: payload.debug,
                 priority: payload.priority,

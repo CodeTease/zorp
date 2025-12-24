@@ -57,6 +57,7 @@ impl CronScheduler {
                                 user: req.user,
                                 cache_key: req.cache_key,
                                 cache_paths: req.cache_paths,
+                                services: req.services,
                                 on_success: req.on_success,
                                 debug: req.debug,
                                 priority: req.priority,

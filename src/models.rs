@@ -9,10 +9,18 @@ use validator::Validate;
 
 pub type JobRegistry = Arc<RwLock<HashMap<String, String>>>;
 
-#[derive(Debug, Deserialize, Clone, Serialize)] // ADDED Serialize here for API response
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct JobLimits {
     pub memory_mb: Option<i64>,
     pub cpu_cores: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct ServiceRequest {
+    pub alias: String, // Network alias (e.g. "postgres")
+    pub image: String,
+    pub env: Option<HashMap<String, String>>,
+    pub command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, Validate)]
@@ -26,9 +34,11 @@ pub struct JobRequest {
     pub callback_url: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
-    pub user: Option<String>, // New field for configurable user
+    pub user: Option<String>,
     pub cache_key: Option<String>,
     pub cache_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub services: Vec<ServiceRequest>, // Added Services
     #[serde(default)]
     pub on_success: Vec<JobRequest>,
     #[serde(default)]
@@ -42,12 +52,11 @@ pub struct JobStatus {
     pub status: String,
     pub exit_code: Option<i32>,
     pub image: String,
-    pub created_at: DateTime<Utc>, // Changed to DateTime<Utc>
+    pub created_at: DateTime<Utc>,
     pub artifact_url: Option<String>,
     pub user_id: Option<String>,
 }
 
-// FIX: Added Serialize and Deserialize so Redis can store/retrieve this struct
 #[derive(Debug, Clone, Serialize, Deserialize)] 
 pub struct JobContext {
     pub id: String,
@@ -58,9 +67,11 @@ pub struct JobContext {
     pub callback_url: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub artifacts_path: Option<String>,
-    pub user: Option<String>, // New field for configurable user
+    pub user: Option<String>,
     pub cache_key: Option<String>,
     pub cache_paths: Option<Vec<String>>,
+    #[serde(default)]
+    pub services: Vec<ServiceRequest>, // Added Services
     #[serde(default)]
     pub on_success: Vec<JobRequest>,
     #[serde(default)]

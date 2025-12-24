@@ -1,11 +1,11 @@
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
     StartContainerOptions, WaitContainerOptions, DownloadFromContainerOptions, ListContainersOptions,
-    StopContainerOptions,
+    StopContainerOptions, NetworkingConfig,
 };
 use bollard::image::CreateImageOptions;
 use bollard::volume::{CreateVolumeOptions, ListVolumesOptions}; 
-use bollard::models::HostConfig;
+use bollard::models::{HostConfig, EndpointSettings};
 use bollard::Docker;
 use futures_util::TryStreamExt; 
 use futures_util::StreamExt;    
@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, AsyncSeekExt, SeekFrom}; 
 use tracing::{info, warn, error};
-use crate::models::{JobContext, JobRegistry, UploadTask};
+use crate::models::{JobContext, JobRegistry, UploadTask, ServiceRequest};
 use crate::db::DbPool;
 use crate::queue::JobQueue;
 use crate::metrics;
@@ -24,6 +24,7 @@ use bollard::network::CreateNetworkOptions;
 use uuid::Uuid;
 use crate::security;
 use crate::cache;
+use std::collections::HashMap;
 
 use aws_sdk_s3;
 
@@ -252,6 +253,67 @@ impl Dispatcher {
                 }).await;
             }
 
+            // --- SPIN UP SERVICE CONTAINERS ---
+            let mut service_containers = Vec::new();
+            let mut service_error = None;
+
+            for service in &job.services {
+                info!("[{}] Starting service container: {} (Image: {})", job.id, service.alias, service.image);
+                
+                if let Err(e) = ensure_image(&docker, &service.image).await {
+                    error!("[{}] Service image pull failed: {}", job.id, e);
+                    service_error = Some(format!("Service {} failed: {}", service.alias, e));
+                    break;
+                }
+
+                let service_name = format!("zorp-svc-{}-{}", job.id, service.alias);
+                let mut svc_endpoints = HashMap::new();
+                svc_endpoints.insert(ZORP_NETWORK_NAME.to_string(), EndpointSettings {
+                    aliases: Some(vec![service.alias.clone()]),
+                    ..Default::default()
+                });
+
+                let svc_env: Option<Vec<String>> = service.env.as_ref().map(|map| {
+                    map.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
+                });
+
+                let svc_config = Config {
+                    image: Some(service.image.clone()),
+                    cmd: service.command.clone(),
+                    env: svc_env,
+                    hostname: Some(service.alias.clone()),
+                    networking_config: Some(NetworkingConfig {
+                        endpoints_config: svc_endpoints,
+                    }),
+                    host_config: Some(HostConfig {
+                        network_mode: Some(ZORP_NETWORK_NAME.to_string()),
+                        auto_remove: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                match docker.create_container(
+                    Some(CreateContainerOptions { name: service_name.as_str(), platform: None }), 
+                    svc_config
+                ).await {
+                    Ok(_) => {
+                        if let Err(e) = docker.start_container::<String>(&service_name, None).await {
+                             error!("[{}] Failed to start service {}: {}", job.id, service.alias, e);
+                             service_error = Some(format!("Failed to start service {}: {}", service.alias, e));
+                             break;
+                        } else {
+                            service_containers.push(service_name);
+                        }
+                    },
+                    Err(e) => {
+                        error!("[{}] Failed to create service {}: {}", job.id, service.alias, e);
+                        service_error = Some(format!("Failed to create service {}: {}", service.alias, e));
+                        break;
+                    }
+                }
+            }
+
             // Input Validation & Policy Check
             // --- HOT VOLUMES (CACHING) ---
             // Move cache logic OUTSIDE of validation/image check blocks to ensure it scopes correctly for later use
@@ -291,7 +353,13 @@ impl Dispatcher {
                 }
             }
 
-            if let Some(err) = validation_error {
+            if let Some(err) = service_error {
+                 error!("[{}] Service Startup Failed: {}", job.id, err);
+                 let _ = log_publisher.publish(&job.id, &format!("ERROR: Service Startup Failed: {}\n", err)).await;
+                 final_status = "FAILED";
+                 final_exit_code = -1;
+                 webhook_logs = format!("Service Error: {}", err);
+            } else if let Some(err) = validation_error {
                  error!("[{}] Input Validation Failed: {}", job.id, err);
                  let _ = log_publisher.publish(&job.id, &format!("ERROR: Input Validation Failed: {}\n", err)).await;
                  final_status = "FAILED";
@@ -511,6 +579,12 @@ impl Dispatcher {
                 }
             }
 
+            // Cleanup Service Containers
+            for svc_name in service_containers {
+                info!("[{}] Cleaning up service: {}", job.id, svc_name);
+                let _ = docker.remove_container(&svc_name, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+            }
+
             // Clean up registry
             {
                 let mut reg = job_registry.write().await;
@@ -576,6 +650,7 @@ impl Dispatcher {
                                 user: next_user_id,
                                 cache_key: next_req.cache_key.clone(),
                                 cache_paths: next_req.cache_paths.clone(),
+                                services: next_req.services.clone(), // Propagate services
                                 on_success: next_req.on_success.clone(),
                                 debug: next_req.debug,
                                 priority: next_req.priority.clone(),

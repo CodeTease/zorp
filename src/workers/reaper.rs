@@ -193,6 +193,7 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
                     user: job.user_id,
                     cache_key: None, // Lost
                     cache_paths: None, // Lost
+                    services: vec![], // Lost
                     on_success: vec![], // Lost
                     debug: false,
                     priority: None,
