@@ -401,7 +401,7 @@ impl Dispatcher {
                         // Tini init for proper signal handling (PID 1 zombie reaping)
                         init: Some(true),
                         // Network Isolation
-                        network_mode: Some(ZORP_NETWORK_NAME.to_string()),
+                        network_mode: if job.enable_network { Some(ZORP_NETWORK_NAME.to_string()) } else { Some("none".to_string()) },
                         // Extra Hosts: Block metadata service
                         extra_hosts: Some(vec!["169.254.169.254:127.0.0.1".to_string()]),
                         binds: Some(binds), // Added Binds for Volumes
@@ -655,6 +655,8 @@ impl Dispatcher {
                                 debug: next_req.debug,
                                 priority: next_req.priority.clone(),
                                 retry_count: 0,
+                                enable_network: next_req.enable_network, // Propagate network setting
+                                run_at: next_req.run_at,
                             };
                             
                             if let Err(e) = queue.enqueue(next_context).await {

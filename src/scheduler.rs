@@ -62,6 +62,8 @@ impl CronScheduler {
                                 debug: req.debug,
                                 priority: req.priority,
                                 retry_count: 0,
+                                enable_network: req.enable_network,
+                                run_at: req.run_at,
                             };
                             
                             // Log last run

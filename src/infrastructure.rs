@@ -58,6 +58,18 @@ pub async fn setup() -> Result<Infrastructure, Box<dyn std::error::Error>> {
         Err(e) => error!("❌ Failed to restore stranded jobs: {}", e),
     }
 
+    // Start Delayed Job Monitor
+    let delay_queue = queue.clone();
+    tokio::spawn(async move {
+        info!("⏰ Delayed Job Monitor started.");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if let Err(e) = delay_queue.monitor_delayed_jobs().await {
+                error!("Delayed job monitor error: {}", e);
+            }
+        }
+    });
+
     // 3. Initialize Docker
     let docker = Docker::connect_with_local_defaults()?;
 

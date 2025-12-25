@@ -156,9 +156,9 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
     // We scan for jobs that have been 'QUEUED' for > 5 minutes and are not running.
 
     let query = if cfg!(feature = "postgres") {
-        "SELECT id, image, commands, callback_url, user_id FROM jobs WHERE status = 'QUEUED' AND created_at < NOW() - INTERVAL '5 minutes'"
+        "SELECT id, image, commands, callback_url, user_id, enable_network FROM jobs WHERE status = 'QUEUED' AND created_at < NOW() - INTERVAL '5 minutes'"
     } else {
-        "SELECT id, image, commands, callback_url, user_id FROM jobs WHERE status = 'QUEUED' AND created_at < date('now', '-5 minutes')"
+        "SELECT id, image, commands, callback_url, user_id, enable_network FROM jobs WHERE status = 'QUEUED' AND created_at < date('now', '-5 minutes')"
     };
 
     // Using a struct that matches the query columns for sqlx::FromRow
@@ -169,6 +169,7 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
         commands: String, // JSON string
         callback_url: Option<String>,
         user_id: Option<String>,
+        enable_network: Option<bool>,
     }
 
     let rows: Result<Vec<StuckJob>, _> = sqlx::query_as(query).fetch_all(db).await;
@@ -198,6 +199,8 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
                     debug: false,
                     priority: None,
                     retry_count: 0,
+                    enable_network: job.enable_network.unwrap_or(false),
+                    run_at: None,
                 };
 
                 info!("♻️  Re-enqueuing stuck job: {}", context.id);

@@ -1,6 +1,6 @@
 use axum::{
     extract::{FromRequestParts, Path, State, Json, Query},
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, StatusCode, HeaderMap},
     routing::{get, post, delete},
     Router,
     middleware,
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use sqlx::Row;
 use serde::{Deserialize};
 use uuid::Uuid;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use bollard::Docker;
 use crate::models::{JobRequest, JobContext, JobStatus, JobRegistry, ApiKey};
 use crate::queue::JobQueue;
@@ -152,6 +152,7 @@ async fn handle_metrics() -> String {
 async fn handle_dispatch(
     State(state): State<Arc<AppState>>,
     Auth(auth): Auth,
+    headers: HeaderMap,
     Json(payload): Json<JobRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Input Validation
@@ -168,11 +169,54 @@ async fn handle_dispatch(
     }
 
     let job_id = Uuid::new_v4().to_string();
+
+    // --- IDEMPOTENCY CHECK ---
+    if let Some(key_header) = headers.get("X-Idempotency-Key") {
+        if let Ok(key) = key_header.to_str() {
+             // 1. Try to acquire lock / set ID
+             // If key exists, this returns False.
+             match state.queue.set_idempotency_key_nx(key, &job_id, 86400).await {
+                 Ok(true) => {
+                     // New key set successfully. Proceed to dispatch.
+                 },
+                 Ok(false) => {
+                     // Key already exists. Fetch the OLD job_id.
+                     match state.queue.get_idempotency_key(key).await {
+                         Ok(Some(existing_job_id)) => {
+                             info!("Idempotency hit for key: {}. Returning existing job_id: {}", key, existing_job_id);
+                             return (StatusCode::OK, Json(serde_json::json!({
+                                "status": "queued",
+                                "job_id": existing_job_id,
+                                "message": "Job returned from idempotency cache"
+                            })));
+                         },
+                         Ok(None) => {
+                             // Race condition: Key expired just now? Or set failed falsely?
+                             // Proceed with NEW job_id.
+                         },
+                         Err(e) => {
+                             error!("Idempotency fetch failed: {}", e);
+                             // If we can't get the old ID, we can't return it.
+                             // Fail safely? Or duplicate?
+                             // Let's return error to be safe.
+                             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Idempotency check failed"})));
+                         }
+                     }
+                 },
+                 Err(e) => {
+                     error!("Idempotency set failed: {}", e);
+                     // Redis is down?
+                     // Proceeding risks duplicates. Failing blocks user.
+                     // Proceed but log.
+                 }
+             }
+        }
+    }
     let user_id = auth.user_id.or(payload.user.clone()); // Prefer Auth user_id, fallback to payload user if allowed (or none)
     
     // 1. Persist to DB first (Status: QUEUED)
     // Note: user_id needs to be added to DB via migration first.
-    let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES (");
+    let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, callback_url, user_id, enable_network, run_at) VALUES (");
     q_builder.push_bind(&job_id);
     q_builder.push(", 'QUEUED', ");
     q_builder.push_bind(&payload.image);
@@ -182,6 +226,10 @@ async fn handle_dispatch(
     q_builder.push_bind(&payload.callback_url);
     q_builder.push(", ");
     q_builder.push_bind(&user_id);
+    q_builder.push(", ");
+    q_builder.push_bind(payload.enable_network);
+    q_builder.push(", ");
+    q_builder.push_bind(payload.run_at);
     q_builder.push(")");
 
     let insert_result = q_builder.build().execute(&state.db).await;
@@ -205,12 +253,17 @@ async fn handle_dispatch(
                 debug: payload.debug,
                 priority: payload.priority,
                 retry_count: 0,
+                enable_network: payload.enable_network,
+                run_at: payload.run_at,
             };
 
             // 2. Push to Redis Queue
             match state.queue.enqueue(context).await {
                 Ok(_) => {
                     info!("Job {} enqueued successfully via Redis", job_id);
+                    
+                    // Idempotency key is already set via SETNX at the top.
+
                     metrics::inc_queued();
                     (StatusCode::ACCEPTED, Json(serde_json::json!({
                         "status": "queued",
@@ -236,6 +289,15 @@ async fn handle_dispatch(
         },
         Err(e) => {
             error!("Database error during dispatch: {}", e);
+            // ROLLBACK IDEMPOTENCY KEY
+            if let Some(key_header) = headers.get("X-Idempotency-Key") {
+                 if let Ok(key) = key_header.to_str() {
+                     warn!("Rolling back idempotency key due to DB error: {}", key);
+                     if let Err(e) = state.queue.delete_idempotency_key(key).await {
+                         error!("Failed to rollback idempotency key {}: {}", key, e);
+                     }
+                 }
+            }
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to persist job"})))
         }
     }

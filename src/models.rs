@@ -44,6 +44,9 @@ pub struct JobRequest {
     #[serde(default)]
     pub debug: bool,
     pub priority: Option<String>,
+    #[serde(default)]
+    pub enable_network: bool,
+    pub run_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -79,6 +82,9 @@ pub struct JobContext {
     pub priority: Option<String>,
     #[serde(default)]
     pub retry_count: u32,
+    #[serde(default)]
+    pub enable_network: bool,
+    pub run_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
