@@ -9,44 +9,25 @@ jobs:
   delete-old-caches:
     runs-on: ubuntu-latest
     permissions:
-      actions: write  # Required to delete caches via API
+      actions: write  # Required to delete caches
     steps:
       - name: Delete caches older than 1 day, but keep the 3 latest
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { data: caches } = await github.rest.actions.listCachesForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            });
+        run: |
+          # Get list of caches in JSON format
+          caches=$(gh cache list --json id,key,createdAt --jq '.')
+          
+          # Sort by createdAt descending (newest first) and process
+          echo "$caches" | jq -r 'sort_by(.createdAt) | reverse | to_entries[] | "\$.key) \$.value.id) \$.value.key) \$.value.createdAt)"' | while read -r index id key createdAt; do
+            # Calculate age in days
+            created_timestamp=$(date -d "$createdAt" +%s)
+            now_timestamp=$(date +%s)
+            age_days=$(( (now_timestamp - created_timestamp) / 86400 ))
             
-            // Sort caches by created_at descending (newest first)
-            caches.actions_caches.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-            
-            const now = new Date();
-            const thresholdMs = 1 * 24 * 60 * 60 * 1000;  // 1 day in milliseconds
-            const keepLatest = 3;  // Number of latest caches to always keep
-            
-            let deletedCount = 0;
-            for (let i = 0; i < caches.actions_caches.length; i++) {
-              const cache = caches.actions_caches[i];
-              const createdAt = new Date(cache.created_at);
-              const isOld = now - createdAt > thresholdMs;
-              const isAmongLatest = i < keepLatest;
-              
-              if (isOld && !isAmongLatest) {
-                await github.rest.actions.deleteCache({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  cache_id: cache.id,
-                });
-                console.log(`Deleted old cache: ${cache.key} (created: ${cache.created_at})`);
-                deletedCount++;
-              } else if (isOld && isAmongLatest) {
-                console.log(`Kept old cache (among latest ${keepLatest}): ${cache.key} (created: ${cache.created_at})`);
-              }
-            }
-            
-            console.log(`Checked ${caches.actions_caches.length} caches. Deleted ${deletedCount}.`);
-            console.log(`Checked ${caches.actions_caches.length} caches. Deleted ${deletedCount}.`);
-    
+            # Keep the 3 latest, delete others if older than 1 day
+            if [ "$index" -lt 3 ]; then
+              echo "Kept cache (among latest 3): $key (created: $createdAt)"
+            elif [ "$age_days" -gt 1 ]; then
+              gh cache delete "$id"
+              echo "Deleted old cache: $key (created: $createdAt, age: $age_days days)"
+            fi
+          done
