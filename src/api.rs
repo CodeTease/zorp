@@ -507,19 +507,25 @@ async fn handle_workflow_dispatch(
     }
 
     match workflow::parse_workflow(&body) {
-        Ok(jobs) => {
+        Ok(graph) => {
+            let workflow_id = Uuid::new_v4().to_string();
+            let mut job_uuid_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             let mut queued_job_ids = Vec::new();
             let mut errors = Vec::new();
 
-            for job_req in jobs {
-                let job_id = Uuid::new_v4().to_string();
+            // 1. Generate UUIDs for all jobs
+            for (key, _) in &graph.jobs {
+                job_uuid_map.insert(key.clone(), Uuid::new_v4().to_string());
+            }
+
+            // 2. Insert all jobs into DB (PENDING)
+            for (key, job_req) in &graph.jobs {
+                let job_id = job_uuid_map.get(key).unwrap().clone();
                 let user_id = auth.user_id.clone().or(job_req.user.clone());
 
-                // 1. Persist to DB
-                // We serialize env, services, and on_success to JSON to preserve pipeline structure and matrix variables.
-                let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, env, services, on_success, callback_url, user_id, enable_network, run_at) VALUES (");
+                let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, env, services, on_success, callback_url, user_id, enable_network, run_at, workflow_id, dependencies_met) VALUES (");
                 q_builder.push_bind(&job_id);
-                q_builder.push(", 'QUEUED', ");
+                q_builder.push(", 'PENDING', ");
                 q_builder.push_bind(&job_req.image);
                 q_builder.push(", ");
                 q_builder.push_bind(serde_json::to_string(&job_req.commands).unwrap_or_default());
@@ -537,59 +543,98 @@ async fn handle_workflow_dispatch(
                 q_builder.push_bind(job_req.enable_network);
                 q_builder.push(", ");
                 q_builder.push_bind(job_req.run_at);
-                q_builder.push(")");
+                q_builder.push(", ");
+                q_builder.push_bind(&workflow_id);
+                q_builder.push(", 0)");
 
-                match q_builder.build().execute(&state.db).await {
-                    Ok(_) => {
-                        let context = JobContext {
-                            id: job_id.clone(),
-                            image: job_req.image,
-                            commands: job_req.commands,
-                            env: job_req.env,
-                            limits: job_req.limits.map(Arc::new),
-                            callback_url: job_req.callback_url,
-                            timeout_seconds: job_req.timeout_seconds,
-                            artifacts_path: job_req.artifacts_path,
-                            user: user_id,
-                            cache_key: job_req.cache_key,
-                            cache_paths: job_req.cache_paths,
-                            services: job_req.services,
-                            on_success: job_req.on_success,
-                            debug: job_req.debug,
-                            priority: job_req.priority,
-                            retry_count: 0,
-                            enable_network: job_req.enable_network,
-                            run_at: job_req.run_at,
-                        };
+                if let Err(e) = q_builder.build().execute(&state.db).await {
+                    error!("Database error during dispatch (job insert): {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "error": "Failed to persist jobs",
+                        "details": e.to_string()
+                    })));
+                }
+            }
 
-                        if let Err(e) = state.queue.enqueue(context).await {
-                             error!("Redis error for job {}: {}", job_id, e);
-                             errors.push(format!("Job {}: Queue failed", job_id));
-                        } else {
-                             metrics::inc_queued();
-                             queued_job_ids.push(job_id);
-                        }
-                    },
-                    Err(e) => {
-                         error!("Database error during dispatch: {}", e);
-                         errors.push(format!("Failed to persist job: {}", e));
+            // 3. Insert Dependencies
+            for (parent_key, children_keys) in &graph.dependencies {
+                let parent_id = job_uuid_map.get(parent_key).unwrap();
+                for child_key in children_keys {
+                     let child_id = job_uuid_map.get(child_key).unwrap();
+                     
+                     let mut q_dep = sqlx::query_builder::QueryBuilder::new("INSERT INTO job_dependencies (parent_job_id, child_job_id) VALUES (");
+                     q_dep.push_bind(parent_id);
+                     q_dep.push(", ");
+                     q_dep.push_bind(child_id);
+                     q_dep.push(")");
+                     
+                     if let Err(e) = q_dep.build().execute(&state.db).await {
+                         error!("Failed to insert dependency: {}", e);
+                         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to map dependencies"})));
+                     }
+                }
+            }
+
+            // 4. Identify Roots (Jobs with 0 dependencies) and Enqueue them
+            // We can check which jobs are NOT in the "values" of dependency map?
+            // Or just check if they have incoming edges.
+            
+            // Build a set of jobs that are children
+            let mut children_set = std::collections::HashSet::new();
+            for children in graph.dependencies.values() {
+                for child in children {
+                    children_set.insert(child.clone());
+                }
+            }
+
+            for (key, job_req) in &graph.jobs {
+                if !children_set.contains(key) {
+                    // This is a root job
+                    let job_id = job_uuid_map.get(key).unwrap();
+                    let user_id = auth.user_id.clone().or(job_req.user.clone());
+
+                    // Update status to QUEUED
+                    let _ = sqlx::query("UPDATE jobs SET status = 'QUEUED' WHERE id = ?")
+                        .bind(job_id)
+                        .execute(&state.db).await;
+
+                    let context = JobContext {
+                        id: job_id.clone(),
+                        image: job_req.image.clone(),
+                        commands: job_req.commands.clone(),
+                        env: job_req.env.clone(),
+                        limits: job_req.limits.clone().map(Arc::new),
+                        callback_url: job_req.callback_url.clone(),
+                        timeout_seconds: job_req.timeout_seconds,
+                        artifacts_path: job_req.artifacts_path.clone(),
+                        user: user_id,
+                        cache_key: job_req.cache_key.clone(),
+                        cache_paths: job_req.cache_paths.clone(),
+                        services: job_req.services.clone(),
+                        on_success: vec![], // Flattened, so no nested execution
+                        debug: job_req.debug,
+                        priority: job_req.priority.clone(),
+                        retry_count: 0,
+                        enable_network: job_req.enable_network,
+                        run_at: job_req.run_at,
+                    };
+
+                    if let Err(e) = state.queue.enqueue(context).await {
+                         error!("Redis error for job {}: {}", job_id, e);
+                         errors.push(format!("Job {}: Queue failed", job_id));
+                    } else {
+                         metrics::inc_queued();
+                         queued_job_ids.push(job_id.clone());
                     }
                 }
             }
 
-            if queued_job_ids.is_empty() && !errors.is_empty() {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "error": "Failed to queue any jobs",
-                    "details": errors
-                })));
-            }
-
             (StatusCode::ACCEPTED, Json(serde_json::json!({
-                "status": "queued",
-                "job_ids": queued_job_ids,
+                "status": "processing",
+                "workflow_id": workflow_id,
+                "queued_roots": queued_job_ids,
                 "errors": if errors.is_empty() { None } else { Some(errors) }
             })))
-
         },
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid workflow YAML", "details": e})))
     }

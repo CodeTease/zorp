@@ -612,10 +612,11 @@ impl Dispatcher {
                 let _ = tokio::fs::remove_dir_all(&host_path).await;
             }
 
-            // --- JOB CHAINING (DAG) ---
+            // --- JOB CHAINING (DAG & Fan-in) ---
             if final_exit_code == 0 && final_status != "FAILED" && final_status != "TIMED_OUT" && final_status != "CANCELLED" {
+                // 1. Existing Legacy Behavior (Nested on_success)
                 if !job.on_success.is_empty() {
-                    info!("[{}] Triggering {} downstream jobs...", job.id, job.on_success.len());
+                    info!("[{}] Triggering {} downstream jobs (Legacy Nested)...", job.id, job.on_success.len());
                     for next_req in &job.on_success {
                         let next_id = Uuid::new_v4().to_string();
                         // Persist to DB first
@@ -666,6 +667,109 @@ impl Dispatcher {
                             }
                         } else {
                              error!("[{}] Failed to persist chained job {}: {:?}", job.id, next_id, insert_result.err());
+                        }
+                    }
+                }
+
+                // 2. New DAG Behavior (Flattened Dependencies)
+                // Find children in job_dependencies table
+                #[derive(sqlx::FromRow)]
+                struct ChildJobId { child_job_id: String }
+
+                let mut q_children = sqlx::query_builder::QueryBuilder::new("SELECT child_job_id FROM job_dependencies WHERE parent_job_id = ");
+                q_children.push_bind(&job.id);
+
+                let children_result = q_children.build_query_as::<ChildJobId>()
+                    .fetch_all(&db).await;
+
+                if let Ok(children) = children_result {
+                    for child in children {
+                        // Atomic Update: Increment met dependencies
+                        // We need to return the new value to check if it matches total needed
+                        // But wait, we need to know the Total Needed.
+                        // We can query: SELECT COUNT(*) FROM job_dependencies WHERE child_job_id = $1
+                        
+                        let child_id = child.child_job_id;
+                        
+                        // Transaction-like logic
+                        let mut tx = db.begin().await.ok(); 
+                        if let Some(mut transaction) = tx {
+                            // 1. Increment dependencies_met
+                            let _ = sqlx::query("UPDATE jobs SET dependencies_met = dependencies_met + 1 WHERE id = ?")
+                                .bind(&child_id)
+                                .execute(&mut *transaction).await;
+                                
+                            // 2. Check if ready
+                            // Get current met
+                            let row_job = sqlx::query_as::<_, (i32,)>("SELECT dependencies_met FROM jobs WHERE id = ?")
+                                .bind(&child_id)
+                                .fetch_optional(&mut *transaction).await;
+                                
+                            // Get total required
+                            let row_count = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM job_dependencies WHERE child_job_id = ?")
+                                .bind(&child_id)
+                                .fetch_one(&mut *transaction).await;
+
+                            if let (Ok(Some((met,))), Ok((total,))) = (row_job, row_count) {
+                                if met as i64 >= total {
+                                    // Ready to run!
+                                    // Fetch the job details to enqueue
+                                    #[derive(sqlx::FromRow)]
+                                    struct JobRow {
+                                        id: String,
+                                        image: String,
+                                        commands: String, // JSON
+                                        env: Option<String>, // JSON
+                                        services: Option<String>, // JSON
+                                        callback_url: Option<String>,
+                                        user_id: Option<String>,
+                                        enable_network: bool,
+                                        artifacts_path: Option<String>,
+                                        cache_key: Option<String>,
+                                    }
+                                    
+                                    let job_data = sqlx::query_as::<_, JobRow>("SELECT id, image, commands, env, services, callback_url, user_id, enable_network, artifacts_path, cache_key FROM jobs WHERE id = ?")
+                                         .bind(&child_id)
+                                         .fetch_optional(&mut *transaction).await;
+                                         
+                                    if let Ok(Some(j)) = job_data {
+                                        let _ = sqlx::query("UPDATE jobs SET status = 'QUEUED' WHERE id = ?")
+                                            .bind(&child_id)
+                                            .execute(&mut *transaction).await;
+                                            
+                                        let context = JobContext {
+                                            id: j.id.clone(),
+                                            image: j.image,
+                                            commands: serde_json::from_str(&j.commands).unwrap_or_default(),
+                                            env: j.env.and_then(|s| serde_json::from_str(&s).ok()),
+                                            limits: None,
+                                            callback_url: j.callback_url,
+                                            timeout_seconds: None,
+                                            artifacts_path: j.artifacts_path,
+                                            user: j.user_id,
+                                            cache_key: j.cache_key,
+                                            cache_paths: None,
+                                            services: j.services.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                                            on_success: vec![],
+                                            debug: false,
+                                            priority: None,
+                                            retry_count: 0,
+                                            enable_network: j.enable_network,
+                                            run_at: None,
+                                        };
+                                        
+                                        if let Err(e) = queue.enqueue(context).await {
+                                            error!("[{}] Failed to enqueue child job {}: {}", job.id, child_id, e);
+                                        } else {
+                                            info!("[{}] Enqueued child job: {}", job.id, child_id);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            let _ = transaction.commit().await;
+                        } else {
+                             error!("Failed to begin transaction for dependency update");
                         }
                     }
                 }
