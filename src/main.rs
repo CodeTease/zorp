@@ -13,6 +13,7 @@ mod workers;
 mod security;
 mod cache;
 mod scheduler;
+mod workflow;
 
 use dotenvy::dotenv;
 use std::env;

@@ -19,6 +19,7 @@ use crate::queue::JobQueue;
 use crate::db::DbPool;
 use crate::engine;
 use crate::metrics;
+use crate::workflow;
 use crate::streaming::RedisLogPublisher;
 use futures_util::StreamExt;
 use sha2::{Sha256, Digest};
@@ -495,6 +496,105 @@ async fn handle_list_jobs(
     }
 }
 
+async fn handle_workflow_dispatch(
+    State(state): State<Arc<AppState>>,
+    Auth(auth): Auth,
+    body: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // RBAC Check
+    if auth.role != "admin" && !auth.permissions.contains(&"dispatch".to_string()) && !auth.permissions.contains(&"*".to_string()) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Insufficient permissions"})));
+    }
+
+    match workflow::parse_workflow(&body) {
+        Ok(jobs) => {
+            let mut queued_job_ids = Vec::new();
+            let mut errors = Vec::new();
+
+            for job_req in jobs {
+                let job_id = Uuid::new_v4().to_string();
+                let user_id = auth.user_id.clone().or(job_req.user.clone());
+
+                // 1. Persist to DB
+                // We serialize env, services, and on_success to JSON to preserve pipeline structure and matrix variables.
+                let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, env, services, on_success, callback_url, user_id, enable_network, run_at) VALUES (");
+                q_builder.push_bind(&job_id);
+                q_builder.push(", 'QUEUED', ");
+                q_builder.push_bind(&job_req.image);
+                q_builder.push(", ");
+                q_builder.push_bind(serde_json::to_string(&job_req.commands).unwrap_or_default());
+                q_builder.push(", ");
+                q_builder.push_bind(serde_json::to_string(&job_req.env).unwrap_or_default());
+                q_builder.push(", ");
+                q_builder.push_bind(serde_json::to_string(&job_req.services).unwrap_or_default());
+                q_builder.push(", ");
+                q_builder.push_bind(serde_json::to_string(&job_req.on_success).unwrap_or_default());
+                q_builder.push(", ");
+                q_builder.push_bind(&job_req.callback_url);
+                q_builder.push(", ");
+                q_builder.push_bind(&user_id);
+                q_builder.push(", ");
+                q_builder.push_bind(job_req.enable_network);
+                q_builder.push(", ");
+                q_builder.push_bind(job_req.run_at);
+                q_builder.push(")");
+
+                match q_builder.build().execute(&state.db).await {
+                    Ok(_) => {
+                        let context = JobContext {
+                            id: job_id.clone(),
+                            image: job_req.image,
+                            commands: job_req.commands,
+                            env: job_req.env,
+                            limits: job_req.limits.map(Arc::new),
+                            callback_url: job_req.callback_url,
+                            timeout_seconds: job_req.timeout_seconds,
+                            artifacts_path: job_req.artifacts_path,
+                            user: user_id,
+                            cache_key: job_req.cache_key,
+                            cache_paths: job_req.cache_paths,
+                            services: job_req.services,
+                            on_success: job_req.on_success,
+                            debug: job_req.debug,
+                            priority: job_req.priority,
+                            retry_count: 0,
+                            enable_network: job_req.enable_network,
+                            run_at: job_req.run_at,
+                        };
+
+                        if let Err(e) = state.queue.enqueue(context).await {
+                             error!("Redis error for job {}: {}", job_id, e);
+                             errors.push(format!("Job {}: Queue failed", job_id));
+                        } else {
+                             metrics::inc_queued();
+                             queued_job_ids.push(job_id);
+                        }
+                    },
+                    Err(e) => {
+                         error!("Database error during dispatch: {}", e);
+                         errors.push(format!("Failed to persist job: {}", e));
+                    }
+                }
+            }
+
+            if queued_job_ids.is_empty() && !errors.is_empty() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": "Failed to queue any jobs",
+                    "details": errors
+                })));
+            }
+
+            (StatusCode::ACCEPTED, Json(serde_json::json!({
+                "status": "queued",
+                "job_ids": queued_job_ids,
+                "errors": if errors.is_empty() { None } else { Some(errors) }
+            })))
+
+        },
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid workflow YAML", "details": e})))
+    }
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Rate Limiting: Allow 10 requests per second with a burst of 20
     let governor_conf = Arc::new(
@@ -512,6 +612,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(handle_healthz))
         .route("/metrics", get(handle_metrics))
         .route("/dispatch", post(handle_dispatch))
+        .route("/workflow", post(handle_workflow_dispatch))
         .route("/job/:id", delete(handle_cancel_job).get(handle_get_job))
         .route("/job/:id/logs", get(handle_get_job_logs))
         .route("/job/:id/stream", get(handle_stream_logs))

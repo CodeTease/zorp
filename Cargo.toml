@@ -67,6 +67,7 @@ tower_governor = { version = "0.8.0", features = ["axum"] }
 governor = "0.10.4"
 tower = "0.4"
 axum = "0.8.0"
+serde_yaml = "0.9.34"
 
 [features]
 default = ["sqlite"]
