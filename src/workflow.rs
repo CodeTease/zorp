@@ -255,5 +255,6 @@ fn create_base_job_request(job_def: &WorkflowJob) -> JobRequest {
         priority: None,
         enable_network: false,
         run_at: None,
+        matrix: None,
     }
 }

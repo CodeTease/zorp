@@ -47,6 +47,7 @@ pub struct JobRequest {
     #[serde(default)]
     pub enable_network: bool,
     pub run_at: Option<DateTime<Utc>>,
+    pub matrix: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

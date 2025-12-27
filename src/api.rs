@@ -20,6 +20,7 @@ use crate::db::DbPool;
 use crate::engine;
 use crate::metrics;
 use crate::workflow;
+use crate::matrix;
 use crate::streaming::RedisLogPublisher;
 use futures_util::StreamExt;
 use sha2::{Sha256, Digest};
@@ -169,138 +170,153 @@ async fn handle_dispatch(
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Insufficient permissions"})));
     }
 
-    let job_id = Uuid::new_v4().to_string();
+    let expanded_jobs = matrix::expand_job_request(&payload);
+    let mut created_job_ids = Vec::new();
+    let mut errors = Vec::new();
 
-    // --- IDEMPOTENCY CHECK ---
-    if let Some(key_header) = headers.get("X-Idempotency-Key") {
-        if let Ok(key) = key_header.to_str() {
-             // 1. Try to acquire lock / set ID
-             // If key exists, this returns False.
-             match state.queue.set_idempotency_key_nx(key, &job_id, 86400).await {
-                 Ok(true) => {
-                     // New key set successfully. Proceed to dispatch.
-                 },
-                 Ok(false) => {
-                     // Key already exists. Fetch the OLD job_id.
-                     match state.queue.get_idempotency_key(key).await {
-                         Ok(Some(existing_job_id)) => {
-                             info!("Idempotency hit for key: {}. Returning existing job_id: {}", key, existing_job_id);
-                             return (StatusCode::OK, Json(serde_json::json!({
-                                "status": "queued",
-                                "job_id": existing_job_id,
-                                "message": "Job returned from idempotency cache"
-                            })));
-                         },
-                         Ok(None) => {
-                             // Race condition: Key expired just now? Or set failed falsely?
-                             // Proceed with NEW job_id.
-                         },
-                         Err(e) => {
-                             error!("Idempotency fetch failed: {}", e);
-                             // If we can't get the old ID, we can't return it.
-                             // Fail safely? Or duplicate?
-                             // Let's return error to be safe.
-                             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Idempotency check failed"})));
-                         }
+    // Idempotency: We only support it for single job requests for now.
+    // If it's a matrix job (expanded > 1), we skip idempotency or log a warning.
+    let idempotency_key = headers.get("X-Idempotency-Key").and_then(|h| h.to_str().ok());
+
+    if expanded_jobs.len() > 1 && idempotency_key.is_some() {
+        warn!("Idempotency key ignored for matrix job request. It is only supported for single jobs.");
+    }
+
+    // Pre-generate ID for single job case to use in lock
+    let single_job_id = if expanded_jobs.len() == 1 { Some(Uuid::new_v4().to_string()) } else { None };
+    
+    // If single job and idempotency key present, acquire lock FIRST
+    if let (Some(key), Some(job_id)) = (idempotency_key, &single_job_id) {
+         match state.queue.set_idempotency_key_nx(key, job_id, 86400).await {
+             Ok(true) => {
+                 // Lock acquired, proceed.
+             },
+             Ok(false) => {
+                 // Key exists, return old ID
+                 match state.queue.get_idempotency_key(key).await {
+                     Ok(Some(existing_job_id)) => {
+                         info!("Idempotency hit for key: {}. Returning existing job_id: {}", key, existing_job_id);
+                         return (StatusCode::OK, Json(serde_json::json!({
+                            "status": "queued",
+                            "job_id": existing_job_id,
+                            "message": "Job returned from idempotency cache"
+                        })));
+                     },
+                     Ok(None) => {}, // Expired? Proceed with new ID
+                     Err(e) => {
+                         error!("Idempotency fetch failed: {}", e);
+                         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Idempotency check failed"})));
                      }
-                 },
-                 Err(e) => {
-                     error!("Idempotency set failed: {}", e);
-                     // Redis is down?
-                     // Proceeding risks duplicates. Failing blocks user.
-                     // Proceed but log.
                  }
+             },
+             Err(e) => {
+                 error!("Idempotency set failed: {}", e);
+                 // Proceed cautiously
              }
+         }
+    }
+
+    let user_id = auth.user_id.or(payload.user.clone()); 
+    let expanded_len = expanded_jobs.len();
+
+    for job_req in expanded_jobs {
+        // Use pre-generated ID if single, otherwise new ID
+        let job_id = if expanded_len == 1 { single_job_id.clone().unwrap() } else { Uuid::new_v4().to_string() };
+
+        // 1. Persist to DB
+        let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, callback_url, user_id, enable_network, run_at) VALUES (");
+        q_builder.push_bind(&job_id);
+        q_builder.push(", 'QUEUED', ");
+        q_builder.push_bind(&job_req.image);
+        q_builder.push(", ");
+        q_builder.push_bind(serde_json::to_string(&job_req.commands).unwrap_or_default());
+        q_builder.push(", ");
+        q_builder.push_bind(&job_req.callback_url);
+        q_builder.push(", ");
+        q_builder.push_bind(&user_id);
+        q_builder.push(", ");
+        q_builder.push_bind(job_req.enable_network);
+        q_builder.push(", ");
+        q_builder.push_bind(job_req.run_at);
+        q_builder.push(")");
+
+        if let Err(e) = q_builder.build().execute(&state.db).await {
+            error!("Database error during dispatch for job {}: {}", job_id, e);
+            errors.push(format!("Failed to persist job {}: {}", job_id, e));
+            continue; 
+        }
+
+        let context = JobContext {
+            id: job_id.clone(),
+            image: job_req.image,
+            commands: job_req.commands,
+            env: job_req.env,
+            limits: job_req.limits.map(Arc::new),
+            callback_url: job_req.callback_url,
+            timeout_seconds: job_req.timeout_seconds,
+            artifacts_path: job_req.artifacts_path,
+            user: user_id.clone(),
+            cache_key: job_req.cache_key,
+            cache_paths: job_req.cache_paths,
+            services: job_req.services,
+            on_success: job_req.on_success,
+            debug: job_req.debug,
+            priority: job_req.priority,
+            retry_count: 0,
+            enable_network: job_req.enable_network,
+            run_at: job_req.run_at,
+        };
+
+        // 2. Push to Redis Queue
+        match state.queue.enqueue(context).await {
+            Ok(_) => {
+                info!("Job {} enqueued successfully via Redis", job_id);
+                created_job_ids.push(job_id.clone());
+                metrics::inc_queued();
+            },
+            Err(e) => {
+                error!("Redis error for job {}: {}", job_id, e);
+                // Mark as failed in DB
+                let _ = sqlx::query("UPDATE jobs SET status = 'FAILED', logs = ? WHERE id = ?")
+                    .bind(format!("System Error: Queue unavailable - {}", e))
+                    .bind(&job_id)
+                    .execute(&state.db).await;
+                
+                errors.push(format!("Failed to enqueue job {}: {}", job_id, e));
+            }
         }
     }
-    let user_id = auth.user_id.or(payload.user.clone()); // Prefer Auth user_id, fallback to payload user if allowed (or none)
-    
-    // 1. Persist to DB first (Status: QUEUED)
-    // Note: user_id needs to be added to DB via migration first.
-    let mut q_builder = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, callback_url, user_id, enable_network, run_at) VALUES (");
-    q_builder.push_bind(&job_id);
-    q_builder.push(", 'QUEUED', ");
-    q_builder.push_bind(&payload.image);
-    q_builder.push(", ");
-    q_builder.push_bind(serde_json::to_string(&payload.commands).unwrap_or_default());
-    q_builder.push(", ");
-    q_builder.push_bind(&payload.callback_url);
-    q_builder.push(", ");
-    q_builder.push_bind(&user_id);
-    q_builder.push(", ");
-    q_builder.push_bind(payload.enable_network);
-    q_builder.push(", ");
-    q_builder.push_bind(payload.run_at);
-    q_builder.push(")");
 
-    let insert_result = q_builder.build().execute(&state.db).await;
+    // Idempotency key is ALREADY set at the top for single jobs.
+    // If we fail here, we should ideally rollback the key, but for now we rely on TTL.
 
-    match insert_result {
-        Ok(_) => {
-            let context = JobContext {
-                id: job_id.clone(),
-                image: payload.image,
-                commands: payload.commands,
-                env: payload.env,
-                limits: payload.limits.map(Arc::new),
-                callback_url: payload.callback_url,
-                timeout_seconds: payload.timeout_seconds,
-                artifacts_path: payload.artifacts_path,
-                user: user_id,
-                cache_key: payload.cache_key,
-                cache_paths: payload.cache_paths,
-                services: payload.services,
-                on_success: payload.on_success,
-                debug: payload.debug,
-                priority: payload.priority,
-                retry_count: 0,
-                enable_network: payload.enable_network,
-                run_at: payload.run_at,
-            };
-
-            // 2. Push to Redis Queue
-            match state.queue.enqueue(context).await {
-                Ok(_) => {
-                    info!("Job {} enqueued successfully via Redis", job_id);
-                    
-                    // Idempotency key is already set via SETNX at the top.
-
-                    metrics::inc_queued();
-                    (StatusCode::ACCEPTED, Json(serde_json::json!({
-                        "status": "queued",
-                        "job_id": job_id,
-                        "message": "Job added to processing queue"
-                    })))
-                },
-                Err(e) => {
-                    error!("Redis error for job {}: {}", job_id, e);
-                    
-                    // Fallback update if queue fails
-                    // Dynamic SQL: UPDATE jobs SET status = 'FAILED', logs = $1 WHERE id = $2
-                    let mut q_fail = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'FAILED', logs = ");
-                    q_fail.push_bind(format!("System Error: Queue unavailable - {}", e));
-                    q_fail.push(" WHERE id = ");
-                    q_fail.push_bind(&job_id);
-
-                    let _ = q_fail.build().execute(&state.db).await;
-
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Queue unavailable"})))
-                }
+    if created_job_ids.is_empty() && !errors.is_empty() {
+        // Rollback Idempotency if single job failed completely
+        if let Some(key) = idempotency_key {
+            if errors.len() == 1 { // Only if we tried 1 job and failed
+                 let _ = state.queue.delete_idempotency_key(key).await;
             }
-        },
-        Err(e) => {
-            error!("Database error during dispatch: {}", e);
-            // ROLLBACK IDEMPOTENCY KEY
-            if let Some(key_header) = headers.get("X-Idempotency-Key") {
-                 if let Ok(key) = key_header.to_str() {
-                     warn!("Rolling back idempotency key due to DB error: {}", key);
-                     if let Err(e) = state.queue.delete_idempotency_key(key).await {
-                         error!("Failed to rollback idempotency key {}: {}", key, e);
-                     }
-                 }
-            }
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to persist job"})))
         }
+
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to dispatch any jobs",
+            "details": errors
+        })));
+    }
+
+    // Response Format
+    if created_job_ids.len() == 1 {
+        (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "status": "queued",
+            "job_id": created_job_ids[0],
+            "message": "Job added to processing queue"
+        })))
+    } else {
+        (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "status": "queued",
+            "job_ids": created_job_ids,
+            "message": format!("{} jobs added to processing queue", created_job_ids.len())
+        })))
     }
 }
 

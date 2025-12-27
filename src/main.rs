@@ -14,6 +14,9 @@ mod security;
 mod cache;
 mod scheduler;
 mod workflow;
+mod matrix;
+#[cfg(test)]
+mod matrix_tests;
 
 use dotenvy::dotenv;
 use std::env;
