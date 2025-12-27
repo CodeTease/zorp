@@ -6,25 +6,24 @@ mod db;
 mod engine;
 mod models;
 mod queue;
-mod metrics; // Added metrics module
+mod metrics;
+mod streaming;
+mod infrastructure;
+mod workers;
+mod security;
+mod cache;
+mod scheduler;
+mod workflow;
+mod matrix;
+#[cfg(test)]
+mod matrix_tests;
 
-use bollard::Docker;
 use dotenvy::dotenv;
 use std::env;
-
-use aws_config::{self, BehaviorVersion};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{error, info, warn}; 
-use crate::queue::{RedisQueue, JobQueue};
-use crate::models::{JobRegistry, StreamRegistry};
-use tokio::sync::RwLock;
-use std::collections::HashMap;
-use bollard::container::ListContainersOptions;
-use crate::db::sql_placeholder;
-
-const PORT: u16 = 3000;
-const MAX_CONCURRENT_JOBS: usize = 50;
+use tracing::{info, warn}; 
+use crate::queue::JobQueue;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,176 +31,169 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     dotenv().ok();
-    tracing_subscriber::fmt::init();
 
-    let secret_key = env::var("ZORP_SECRET_KEY")
-        .map_err(|_| {
-            error!("ZORP_SECRET_KEY environment variable not set.");
-            std::io::Error::new(std::io::ErrorKind::Other, "Missing ZORP_SECRET_KEY")
-        })?;
+    if env::var("ZORP_LOG_FORMAT").unwrap_or_default().to_lowercase() == "json" {
+        tracing_subscriber::fmt().json().init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
 
     info!(":: Zorp v0.1.0 (Production Edition) ::");
     
-    // 1. Initialize DB
-    let db_pool = db::init_pool().await?;
-
-    // 2. Initialize Redis Queue
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    // 1. Setup Infrastructure (DB, Redis, Docker, S3)
+    let infra = infrastructure::setup().await?;
     
-    if redis_url.starts_with("rediss://") {
-        info!("🔐 Initializing Redis with TLS encryption...");
-    } else {
-        info!("🔌 Initializing Redis via standard connection...");
-    }
+    // 2. Start Background Workers
+    // Reaper (with Leader Election)
+    workers::reaper::spawn(
+        infra.docker.clone(), 
+        infra.db_pool.clone(), 
+        infra.job_registry.clone(),
+        infra.queue.clone(),
+        infra.s3_client.clone(),
+        infra.s3_bucket.clone()
+    );
 
-    let queue = Arc::new(RedisQueue::new(&redis_url));
-    info!("Connected to Redis Queue successfully.");
-
-    // Restore stranded jobs
-    info!("🔎 Checking for stranded jobs in processing queue...");
-    match queue.restore_stranded().await {
-        Ok(0) => info!("✅ No stranded jobs found."),
-        Ok(count) => info!("♻️  Restored {} stranded jobs to the main queue.", count),
-        Err(e) => error!("❌ Failed to restore stranded jobs: {}", e),
-    }
-
-    // 3. Initialize Docker
-    let docker = Docker::connect_with_local_defaults()?;
-
-    // 3b. Initialize JobRegistry & StreamRegistry
-    info!("🔄 Performing State Reconciliation...");
-    let job_registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
-    let stream_registry: StreamRegistry = Arc::new(RwLock::new(HashMap::new()));
-    
-    let mut filters = HashMap::new();
-    filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
-    
-    let options = ListContainersOptions {
-        all: true,
-        filters,
-        ..Default::default()
-    };
-    
-    if let Ok(containers) = docker.list_containers(Some(options)).await {
-        let mut reg = job_registry.write().await;
-        for c in containers {
-            // Only care about running containers to populate registry
-            if c.state.as_deref() == Some("running") {
-                if let (Some(id), Some(labels)) = (c.id, c.labels) {
-                     if let Some(job_id) = labels.get("job_id") {
-                         // Verify with DB
-                         let query = format!("SELECT status FROM jobs WHERE id = {}", sql_placeholder(1));
-                         if let Ok(Some((status,))) = sqlx::query_as::<_, (String,)>(&query)
-                            .bind(job_id)
-                            .fetch_optional(&db_pool).await 
-                         {
-                             if status == "RUNNING" {
-                                 info!("   - Re-attached job: {} (Container: {})", job_id, id);
-                                 reg.insert(job_id.clone(), id.clone());
-                                 // Note: We cannot re-attach log stream easily for recovered jobs 
-                                 // without implementing `docker attach` logic again, which is complex.
-                                 // For now, recovered jobs won't support live streaming, only file logging.
-                             } else {
-                                 warn!("   - Zombie container found (Job {} is {}). Will be reaped.", job_id, status);
-                             }
-                         }
-                     }
-                }
+    // Queue Monitor
+    let queue_monitor = infra.queue.clone();
+    tokio::spawn(async move {
+        info!("❤️  Queue Monitor (Heartbeat & Auto-Recovery) started.");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Err(e) = queue_monitor.monitor_stranded_jobs().await {
+                tracing::error!("❌ Queue Monitor Error: {}", e);
             }
         }
-    }
-    info!("✅ State Reconciliation Complete. Active Jobs: {}", job_registry.read().await.len());
+    });
 
-    // 4. Run Zombie Reaper (Background Task)
-    engine::spawn_reaper_task(docker.clone(), db_pool.clone());
-
-    // 5. Initialize Engine (Dispatcher)
+    // 3. Initialize Engine (Dispatcher)
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
     
-    // Mandatory S3 Configuration
-    let s3_bucket = env::var("S3_BUCKET_NAME").map_err(|_| {
-        error!("❌ S3_BUCKET_NAME is mandatory in Production Mode.");
-        std::io::Error::new(std::io::ErrorKind::Other, "Missing S3_BUCKET_NAME")
-    })?;
+    let secret_key = env::var("ZORP_SECRET_KEY")
+        .expect("ZORP_SECRET_KEY environment variable not set.");
 
-    info!("Configuring S3 client...");
-    let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
-
-    if let Ok(endpoint) = env::var("S3_ENDPOINT_URL") {
-        s3_config_builder = s3_config_builder.endpoint_url(endpoint);
-    }
-    if let Ok(force_path) = env::var("S3_FORCE_PATH_STYLE") {
-            s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
-    }
-    
-    let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
+    // Configuration
+    let max_jobs = env::var("ZORP_MAX_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    info!("⚙️  Configuration: ZORP_MAX_JOBS = {}", max_jobs);
     
     let dispatcher = Arc::new(engine::Dispatcher::new(
-        docker.clone(),
-        db_pool.clone(),
-        http_client,
-        MAX_CONCURRENT_JOBS,
-        job_registry.clone(),
-        stream_registry.clone(),
-        s3_client.clone(),
-        s3_bucket.clone(),
+        infra.docker.clone(),
+        infra.db_pool.clone(),
+        http_client.clone(),
+        max_jobs,
+        infra.job_registry.clone(),
+        infra.s3_client.clone(),
+        infra.s3_bucket.clone(),
         secret_key.clone(),
-        queue.clone(),
+        infra.queue.clone(),
     ));
 
-    // 6. Spawn WORKER THREAD (with Graceful Shutdown support)
-    let queue_for_worker = queue.clone();
-    let dispatcher_for_worker = dispatcher.clone();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
-    
-    let worker_shutdown_rx = shutdown_tx.subscribe();
+    // 3b. Recover State (Adopt Orphans)
+    if let Err(e) = dispatcher.reconcile_state().await {
+        warn!("⚠️  Failed to reconcile state: {}", e);
+    }
 
-    tokio::spawn(async move {
-        info!("👷 Worker thread started.");
-        let mut shutdown = worker_shutdown_rx;
-        loop {
-            tokio::select! {
-                _ = shutdown.recv() => {
-                    info!("👷 Worker thread stopping...");
-                    break;
-                }
-                job = queue_for_worker.dequeue() => {
-                    match job {
-                        Ok(Some(job)) => {
-                            info!("📥 Worker picked up job: {}", job.id);
-                            dispatcher_for_worker.dispatch(job).await; 
-                        }
-                        Ok(None) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                        Err(e) => {
-                            error!("❌ Queue Error: {}. Retrying in 5s...", e);
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // 4. Spawn WORKER THREADS (with Graceful Shutdown support)
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let upload_worker_shutdown_rx = shutdown_tx.subscribe();
+    let webhook_worker_shutdown_rx = shutdown_tx.subscribe();
+    let scheduler_shutdown_rx = shutdown_tx.subscribe();
+
+    let worker_count: usize = env::var("ZORP_WORKER_COUNT")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse()
+        .unwrap_or(1);
+    
+    info!("🚀 Spawning {} worker threads...", worker_count);
+
+    let mut worker_handles = Vec::new();
+
+    for i in 0..worker_count {
+        let queue_for_worker = infra.queue.clone();
+        let dispatcher_for_worker = dispatcher.clone();
+        let mut shutdown = shutdown_tx.subscribe();
+        
+        let handle = tokio::spawn(async move {
+            info!("👷 Worker #{} thread started.", i + 1);
+            loop {
+                tokio::select! {
+                    _ = shutdown.recv() => {
+                        info!("👷 Worker #{} thread stopping...", i + 1);
+                        break;
+                    }
+                    job = queue_for_worker.dequeue() => {
+                        match job {
+                            Ok(Some(job)) => {
+                                info!("📥 Worker #{} picked up job: {}", i + 1, job.id);
+                                dispatcher_for_worker.dispatch(job).await; 
+                            }
+                            Ok(None) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            Err(e) => {
+                                tracing::error!("❌ Queue Error (Worker #{}): {}. Retrying in 5s...", i + 1, e);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
                         }
                     }
                 }
             }
-        }
+            info!("👷 Worker #{} thread stopped.", i + 1);
+        });
+        worker_handles.push(handle);
+    }
+
+    // 5. Upload Worker (Moved to separate module)
+    workers::upload::spawn(
+        infra.queue.clone(), 
+        infra.s3_client.clone(), 
+        infra.s3_bucket.clone(), 
+        infra.db_pool.clone(), 
+        upload_worker_shutdown_rx
+    );
+
+    // 5b. Webhook Worker
+    workers::webhook::spawn(
+        infra.queue.clone(),
+        http_client.clone(),
+        secret_key.clone(),
+        webhook_worker_shutdown_rx
+    );
+
+    // 5c. Cron Scheduler
+    let scheduler_db = infra.db_pool.clone();
+    let scheduler_queue = infra.queue.clone();
+    tokio::spawn(async move {
+        scheduler::spawn(
+            scheduler_db,
+            scheduler_queue,
+            scheduler_shutdown_rx
+        ).await;
     });
 
-    // 7. Setup App State
+    // 6. Setup App State
     let state = Arc::new(api::AppState {
-        db: db_pool.clone(),
-        queue: queue,
+        db: infra.db_pool.clone(),
+        queue: infra.queue.clone(),
         secret_key,
-        docker: docker,
-        job_registry: job_registry,
-        stream_registry: stream_registry,
-        s3_client: Some(s3_client),
-        s3_bucket: Some(s3_bucket),
+        docker: infra.docker,
+        job_registry: infra.job_registry,
+        s3_client: Some(infra.s3_client),
+        s3_bucket: Some(infra.s3_bucket),
     });
 
-    // 8. Start Server with Graceful Shutdown
+    // 7. Start Server with Graceful Shutdown
     let app = api::create_router(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], PORT));
+    let port = env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -233,6 +225,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!("🛑 Shutdown signal received.");
             let _ = shutdown_tx.send(());
+
+            // --- GRACEFUL SHUTDOWN DRAIN LOGIC ---
+            info!("⏳ Waiting for worker threads to stop...");
+            for handle in worker_handles {
+                let _ = handle.await;
+            }
+
+            info!("⏳ Draining active jobs...");
+            let drain_timeout = std::time::Duration::from_secs(60); // 60s hard timeout
+            let start_drain = std::time::Instant::now();
+            
+            loop {
+                let running = metrics::get_running(); // You'll need to expose this or use existing getter
+                if running == 0 {
+                    info!("✅ All jobs finished.");
+                    break;
+                }
+
+                if start_drain.elapsed() > drain_timeout {
+                    warn!("⚠️  Shutdown timeout reached! Forcefully killing {} running jobs.", running);
+                    break;
+                }
+
+                info!("⏳ Waiting for {} active jobs to finish...", running);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         })
         .await
         .unwrap();
