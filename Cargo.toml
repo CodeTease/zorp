@@ -20,7 +20,7 @@ axum = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
 
 # Database (SQLx with conditional features)
-sqlx = { version = "0.7", features = ["runtime-tokio", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "macros"] }
 
 # AWS S3 (Mandatory Log Storage)
 aws-config = { version = "1.5.3" }
