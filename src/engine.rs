@@ -146,6 +146,54 @@ impl Dispatcher {
         }
     }
 
+    pub async fn reconcile_state(&self) -> Result<(), String> {
+        info!("Starting reconciliation...");
+        let containers = self.docker.list_containers(Some(ListContainersOptions {
+            filters: HashMap::from([("label".to_string(), vec!["managed_by=zorp".to_string()])]),
+            ..Default::default()
+        })).await.map_err(|e| format!("Failed to list containers: {}", e))?;
+
+        for c in containers {
+            if let Some(names) = c.names {
+                // Docker names start with slash usually, e.g. /zorp-uuid
+                let name = names.first().ok_or("No name")?.trim_start_matches('/');
+                
+                // Get Job ID from Label
+                let job_id = if let Some(labels) = c.labels.as_ref() {
+                    labels.get("job_id").cloned()
+                } else {
+                    None
+                };
+
+                if let Some(id) = job_id {
+                    // Update Registry
+                    info!("Adopting orphaned container: {} (Job ID: {})", name, id);
+                    {
+                        let mut reg = self.job_registry.write().await;
+                        reg.insert(id.clone(), name.to_string());
+                    }
+
+                    // We should also ideally re-attach log streaming here if we want full recovery,
+                    // but for now we at least ensure we can CANCEL it and track it.
+                    // If the original process died, the log streaming loop died.
+                    // Re-attaching logs:
+                    let docker = self.docker.clone();
+                    let container_name = name.to_string();
+                    let job_id_clone = id.clone();
+                    let redis_client = self.queue.get_client();
+                    let log_publisher = RedisLogPublisher::new(redis_client);
+                    
+                    // Spawn a log streamer just in case it's still running
+                    tokio::spawn(async move {
+                        // We assume it's running. If it exits, this returns.
+                         stream_logs_to_file_and_broadcast(&docker, &container_name, &job_id_clone, &log_publisher).await;
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn dispatch(&self, job: JobContext) {
         let permit = self.limiter.clone().acquire_owned().await.unwrap();
         let docker = self.docker.clone();
@@ -165,9 +213,11 @@ impl Dispatcher {
             let start_time = Instant::now();
             let container_name = format!("zorp-{}", job.id);
             
-            // Redis Publisher for logs
-            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-            let log_publisher = RedisLogPublisher::new(&redis_url);
+            // Redis Publisher for logs (Reuse client from queue)
+            // We need to cast the Arc<dyn JobQueue> to RedisQueue if possible, or extend the trait to return the client.
+            // I extended the trait to have `get_client()`.
+            let redis_client = queue.get_client();
+            let log_publisher = RedisLogPublisher::new(redis_client);
 
             // Register job for cancellation
             {

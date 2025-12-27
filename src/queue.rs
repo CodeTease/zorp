@@ -43,6 +43,9 @@ pub trait JobQueue: Send + Sync {
          // I will implement delete_idempotency_key instead.
          unimplemented!("Use trait methods");
     }
+
+    // Helper to get raw client for log publisher or others
+    fn get_client(&self) -> redis::Client;
 }
 
 // --- REDIS IMPLEMENTATION ---
@@ -60,6 +63,8 @@ pub struct RedisQueue {
 
 impl RedisQueue {
     pub fn new(url: &str) -> Self {
+        // Support redis+sentinel:// via the url string which redis crate supports automatically
+        // but we need to ensure the client is created correctly.
         let client = redis::Client::open(url).expect("Invalid Redis URL");
         Self {
             client,
@@ -643,5 +648,9 @@ impl JobQueue for RedisQueue {
         // I will implement it to satisfy the trait I just defined, but panicking is bad if called.
         // Actually, I can just return a connection!
         self.client.get_multiplexed_async_connection().await.expect("Redis connection failed")
+    }
+
+    fn get_client(&self) -> redis::Client {
+        self.client.clone()
     }
 }

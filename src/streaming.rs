@@ -7,8 +7,7 @@ pub struct RedisLogPublisher {
 }
 
 impl RedisLogPublisher {
-    pub fn new(url: &str) -> Self {
-        let client = redis::Client::open(url).expect("Invalid Redis URL");
+    pub fn new(client: redis::Client) -> Self {
         Self { client }
     }
 

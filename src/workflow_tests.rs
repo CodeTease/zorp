@@ -99,21 +99,6 @@ jobs:
         assert!(graph.dependencies.is_empty());
     }
 
-    // Circular dependency detection is not implemented in the current iterative parser 
-    // unless we add a specific check (Topological Sort).
-    // The previous implementation did it via recursion stack.
-    // The current implementation just builds the map.
-    // However, if the user requested to FIX the Fan-in issue, and I moved to a flat structure,
-    // the execution engine handles the DAG.
-    // But does `parse_workflow` fail on cycles?
-    // My new implementation does NOT check for cycles.
-    // I should probably remove this test or accept that cycle detection is defered to execution (it will just stall)
-    // or I should implement a cycle check.
-    // For now, I will comment it out or remove it, as adding cycle detection wasn't explicitly asked, 
-    // though good practice.
-    // Wait, the prompt says "Solve DAG & Fan-in".
-    // I will skip the cycle test for now to focus on the Fan-in solution working.
-    /*
     #[test]
     fn test_circular_dependency() {
         let yaml = r#"
@@ -130,6 +115,11 @@ jobs:
 "#;
         let result = parse_workflow(yaml);
         assert!(result.is_err());
+        match result {
+            Err(crate::workflow::WorkflowError::CycleDetected(node)) => {
+                assert!(node == "job1" || node == "job2");
+            },
+            _ => panic!("Expected CycleDetected error"),
+        }
     }
-    */
 }

@@ -1,10 +1,26 @@
 use serde::{Deserialize, Serialize};
 use crate::models::JobRequest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use itertools::Itertools;
+use regex::Regex;
+use thiserror::Error;
+use sha2::{Sha256, Digest};
 
 #[cfg(test)]
 #[path = "./workflow_tests.rs"]
 mod tests;
+
+#[derive(Error, Debug)]
+pub enum WorkflowError {
+    #[error("YAML syntax error: {0}")]
+    YamlError(#[from] serde_yaml::Error),
+    #[error("Missing dependency: Job '{0}' needs '{1}', but it is not defined.")]
+    MissingDependency(String, String),
+    #[error("Cycle detected in workflow dependencies involving job: {0}")]
+    CycleDetected(String),
+    #[error("Internal error: {0}")]
+    InternalError(String),
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Workflow {
@@ -38,32 +54,22 @@ pub struct WorkflowGraph {
     pub dependencies: HashMap<String, Vec<String>>,
 }
 
-pub fn parse_workflow(yaml_content: &str) -> Result<WorkflowGraph, String> {
-    let workflow: Workflow = serde_yaml::from_str(yaml_content)
-        .map_err(|e| format!("Failed to parse YAML: {}", e))?;
+pub fn parse_workflow(yaml_content: &str) -> Result<WorkflowGraph, WorkflowError> {
+    let workflow: Workflow = serde_yaml::from_str(yaml_content)?;
 
     let mut job_map: HashMap<String, JobRequest> = HashMap::new();
     let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
 
     // 1. Expand Matrix and create JobRequests
-    // To handle dependencies correctly with matrix expansion, we need to know the specific names of the expanded jobs.
-    // If Job B needs Job A, and Job A has matrix (A1, A2), then Job B needs BOTH A1 and A2?
-    // OR if Job B also has matrix (B1, B2), does B1 need A1?
-    // Standard GitHub Actions behavior:
-    // - If A is matrix, B (single) needs A (all variants).
-    // - If A and B are matrix matching? Complexity high.
-    // Let's assume for now: "needs: A" means "wait for all variants of A".
-
-    // We first generate all job instances and give them unique keys.
-    // Key format: "jobname" or "jobname-matrixSuffix"
-    
-    // We need a map from "Original Job Name" to "List of Expanded Job Keys"
     let mut expanded_keys_map: HashMap<String, Vec<String>> = HashMap::new();
 
     for (job_name, job_def) in &workflow.jobs {
         let expanded_jobs = expand_matrix(job_name, job_def);
         let mut keys = Vec::new();
         for (suffix, req) in expanded_jobs {
+            // Use original name if no matrix, otherwise append suffix (which is now a hash or structured)
+            // But for readability in logs, we might want "job-ubuntu-14" style if possible.
+            // The expand_matrix function returns a readable suffix.
             let key = if suffix.is_empty() { job_name.clone() } else { format!("{}-{}", job_name, suffix) };
             job_map.insert(key.clone(), req);
             keys.push(key);
@@ -73,11 +79,12 @@ pub fn parse_workflow(yaml_content: &str) -> Result<WorkflowGraph, String> {
 
     // 2. Resolve Dependencies
     for (job_name, job_def) in &workflow.jobs {
-        let child_keys = expanded_keys_map.get(job_name).ok_or("Internal error")?;
+        let child_keys = expanded_keys_map.get(job_name)
+            .ok_or_else(|| WorkflowError::InternalError("Expanded keys not found".to_string()))?;
 
         for needed_job_name in &job_def.needs {
             let parent_keys = expanded_keys_map.get(needed_job_name)
-                .ok_or_else(|| format!("Job '{}' needs '{}', but it is not defined.", job_name, needed_job_name))?;
+                .ok_or_else(|| WorkflowError::MissingDependency(job_name.clone(), needed_job_name.clone()))?;
 
             // Fan-in: All children depend on all parents (by default)
             for parent_key in parent_keys {
@@ -88,42 +95,96 @@ pub fn parse_workflow(yaml_content: &str) -> Result<WorkflowGraph, String> {
         }
     }
 
+    // 3. Cycle Detection
+    detect_cycles(&job_map, &dependencies)?;
+
     Ok(WorkflowGraph {
         jobs: job_map,
         dependencies,
     })
 }
 
+fn detect_cycles(
+    jobs: &HashMap<String, JobRequest>, 
+    dependencies: &HashMap<String, Vec<String>>
+) -> Result<(), WorkflowError> {
+    // Build adjacency list (Parent -> Children is what we have).
+    // A cycle exists if we encounter a node currently in the recursion stack.
+    let mut visited = HashSet::new();
+    let mut recursion_stack = HashSet::new();
+
+    // dependencies map is: Parent -> Children
+    // We need to iterate all nodes. jobs keys are all nodes.
+    for node in jobs.keys() {
+        if detect_cycle_dfs(node, dependencies, &mut visited, &mut recursion_stack) {
+            return Err(WorkflowError::CycleDetected(node.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn detect_cycle_dfs(
+    node: &str,
+    dependencies: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+    recursion_stack: &mut HashSet<String>
+) -> bool {
+    if recursion_stack.contains(node) {
+        return true;
+    }
+    if visited.contains(node) {
+        return false;
+    }
+
+    visited.insert(node.to_string());
+    recursion_stack.insert(node.to_string());
+
+    if let Some(children) = dependencies.get(node) {
+        for child in children {
+            if detect_cycle_dfs(child, dependencies, visited, recursion_stack) {
+                return true;
+            }
+        }
+    }
+
+    recursion_stack.remove(node);
+    false
+}
+
 fn expand_matrix(_name: &str, job_def: &WorkflowJob) -> Vec<(String, JobRequest)> {
     if let Some(strategy) = &job_def.strategy {
         if !strategy.matrix.is_empty() {
-             // Cartesian product of matrix values
-             let mut combinations: Vec<HashMap<String, String>> = vec![HashMap::new()];
-             
-             for (key, values) in &strategy.matrix {
-                 let mut new_combinations = Vec::new();
-                 for combo in combinations {
-                     for val in values {
-                         let mut new_combo = combo.clone();
-                         new_combo.insert(key.clone(), val.clone());
-                         new_combinations.push(new_combo);
-                     }
-                 }
-                 combinations = new_combinations;
-             }
+             // Use itertools for Cartesian product
+             // 1. Sort keys to ensure deterministic order
+             let mut sorted_keys: Vec<_> = strategy.matrix.keys().collect();
+             sorted_keys.sort();
+
+             // 2. Prepare iterators
+             let values_iter = sorted_keys.iter()
+                 .map(|k| strategy.matrix.get(*k).unwrap().clone())
+                 .multi_cartesian_product();
 
              let mut requests = Vec::new();
-             for combo in combinations {
+
+             for values in values_iter {
+                 // values is Vec<String> corresponding to sorted_keys
+                 let combo: HashMap<String, String> = sorted_keys.iter()
+                     .zip(values.iter())
+                     .map(|(k, v)| ((*k).clone(), v.clone()))
+                     .collect();
+
                  let mut new_image = job_def.image.clone();
-                 // Simple variable substitution
+                 // Flexible variable substitution using Regex
                  for (k, v) in &combo {
-                     new_image = new_image.replace(&format!("${{{{ matrix.{} }}}}", k), v);
+                     let re = Regex::new(&format!(r"\$\{{\{{\s*matrix\.{}\s*\}}\}}", regex::escape(k))).unwrap();
+                     new_image = re.replace_all(&new_image, v.as_str()).to_string();
                  }
                  
                  let mut new_commands = job_def.commands.clone();
                  for cmd in &mut new_commands {
                       for (k, v) in &combo {
-                          *cmd = cmd.replace(&format!("${{{{ matrix.{} }}}}", k), v);
+                          let re = Regex::new(&format!(r"\$\{{\{{\s*matrix\.{}\s*\}}\}}", regex::escape(k))).unwrap();
+                          *cmd = re.replace_all(cmd, v.as_str()).to_string();
                       }
                  }
 
@@ -134,21 +195,39 @@ fn expand_matrix(_name: &str, job_def: &WorkflowJob) -> Vec<(String, JobRequest)
                  let mut env = req.env.clone().unwrap_or_default();
                  let mut suffix_parts = Vec::new();
 
-                 // Deterministic sort for suffix generation
-                 let mut sorted_keys: Vec<_> = combo.keys().collect();
-                 sorted_keys.sort();
-
-                 for k in sorted_keys {
-                     let v = &combo[k];
+                 for (k, v) in &combo {
                      env.insert(format!("MATRIX_{}", k.to_uppercase()), v.clone());
+                     // Also substitute in ENV values if they exist
                      for (_, env_val) in env.iter_mut() {
-                         *env_val = env_val.replace(&format!("${{{{ matrix.{} }}}}", k), v);
+                         let re = Regex::new(&format!(r"\$\{{\{{\s*matrix\.{}\s*\}}\}}", regex::escape(k))).unwrap();
+                         *env_val = re.replace_all(env_val, v.as_str()).to_string();
                      }
-                     suffix_parts.push(v.to_string()); // e.g. "14", "ubuntu"
                  }
-                 req.env = Some(env);
+
+                 // Generate readable suffix parts based on sorted keys
+                 for k in &sorted_keys {
+                     if let Some(v) = combo.get(*k) {
+                         suffix_parts.push(v.clone());
+                     }
+                 }
                  
-                 let suffix = suffix_parts.join("-");
+                 // Generate a Hash for robust uniqueness
+                 let combo_str = suffix_parts.join("-");
+                 let mut hasher = Sha256::new();
+                 hasher.update(combo_str.as_bytes());
+                 let result = hasher.finalize();
+                 let hash_suffix = hex::encode(result);
+                 // Shorten hash to 8 chars
+                 let short_hash = &hash_suffix[..8];
+
+                 // Readable suffix + Short Hash to avoid collision if values are similar but keys different?
+                 // Actually standard GH actions just uses values. 
+                 // But user suggested: "Use hash as suffix for internal ID, but keep display name readable".
+                 // Here we return the suffix used for the KEY in the map.
+                 // So let's use readable values + short hash for safety.
+                 let suffix = format!("{}-{}", combo_str, short_hash);
+                 
+                 req.env = Some(env);
                  requests.push((suffix, req));
              }
              return requests;

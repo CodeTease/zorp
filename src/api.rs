@@ -415,15 +415,16 @@ struct StreamLogsQuery {
 }
 
 async fn handle_stream_logs(
-    State(_state): State<Arc<AppState>>, // Added underscore
+    State(state): State<Arc<AppState>>, // Removed underscore to use state
     Path(job_id): Path<String>,
     Query(query): Query<StreamLogsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     info!("Client connected to stream logs for job: {} (Resume: {:?})", job_id, query.last_id);
 
     // Redis Subscriber
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let publisher = RedisLogPublisher::new(&redis_url);
+    // Use the client from the queue
+    let redis_client = state.queue.get_client();
+    let publisher = RedisLogPublisher::new(redis_client);
 
     let stream = async_stream::stream! {
         match publisher.subscribe(&job_id, query.last_id).await {
@@ -636,7 +637,7 @@ async fn handle_workflow_dispatch(
                 "errors": if errors.is_empty() { None } else { Some(errors) }
             })))
         },
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid workflow YAML", "details": e})))
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid workflow YAML", "details": e.to_string()})))
     }
 }
 

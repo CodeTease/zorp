@@ -90,6 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         infra.queue.clone(),
     ));
 
+    // 3b. Recover State (Adopt Orphans)
+    if let Err(e) = dispatcher.reconcile_state().await {
+        warn!("⚠️  Failed to reconcile state: {}", e);
+    }
+
     // 4. Spawn WORKER THREADS (with Graceful Shutdown support)
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
     let upload_worker_shutdown_rx = shutdown_tx.subscribe();

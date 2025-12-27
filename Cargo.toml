@@ -68,6 +68,8 @@ governor = "0.10.4"
 tower = "0.4"
 axum = "0.8.0"
 serde_yaml = "0.9.34"
+itertools = "0.14.0"
+thiserror = "2.0.17"
 
 [features]
 default = ["sqlite"]
