@@ -854,32 +854,10 @@ impl Dispatcher {
                 info!("[{}] Enqueuing log upload...", job.id);
                 if let Err(e) = queue.enqueue_upload(task).await {
                     error!("[{}] Failed to enqueue log upload: {}", job.id, e);
-                    // If enqueue fails, we might leave the file in /tmp to be GC'd later, 
-                    // or we could mark job as failed. 
-                    // Per prompt: "failure in upload should not fail job logic".
-                    // But if we can't even enqueue, logs are lost.
                 }
             } else if final_status != "FAILED" && final_status != "CANCELLED" {
                 warn!("[{}] No logs were generated or captured.", job.id);
             }
-
-            // --- ARTIFACT PERSISTENCE (DECOUPLED) ---
-            // NOTE: Artifact upload was originally inside the main block.
-            // We should also decouple it if we want to follow the pattern, 
-            // but the artifacts are downloaded streamingly to a file in /tmp.
-            // The original code uploaded it immediately. 
-            // We can check if `final_artifact_url` is set.
-            // Wait, the original code for artifacts:
-            // "if let Ok(_) = s3.put_object()... final_artifact_url = ..."
-            // I need to change that part too if I want full decoupling.
-            // However, the prompt specifically mentioned "Upload log and artifact... sequential".
-            // Let's modify the artifact part above (I need to find where I left it).
-            // Actually, I missed modifying the artifact part in the previous search block because it was earlier.
-            // I will address artifact upload decoupling in a separate replacement or assume logs are the main bottleneck.
-            // But let's look at `final_artifact_url` usage below.
-            
-            // Dynamic SQL: UPDATE jobs SET status = $1, exit_code = $2, logs = $3, artifact_url = $4 WHERE id = $5 AND status != 'CANCELLED'
-            // OPTIMISTIC LOCKING: We prevent overwriting 'CANCELLED' status.
             
             let mut q_final = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = ");
             q_final.push_bind(final_status);

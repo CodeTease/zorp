@@ -31,12 +31,8 @@ tokio-stream = { version = "0.1" }
 bollard = "0.15"
 
 # Queue System (Redis)
-redis = { version = "0.32", features = ["tokio-comp", "tokio-rustls-comp"] }
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp"] }
 async-trait = "0.1"
-
-# CRITICAL FIX FOR REDIS TLS PANIC:
-# Redis 0.32 uses rustls 0.23 which requires an explicit crypto provider.
-# We explicitly add rustls 0.23 and enable the "ring" provider here.
 rustls = { version = "0.23", features = ["ring"] }
 
 # Utilities

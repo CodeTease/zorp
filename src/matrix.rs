@@ -50,9 +50,7 @@ fn substitute_variables(req: &mut JobRequest, vars: &HashMap<String, String>) {
         for val in env.values_mut() {
             *val = substitute_string(val, vars);
         }
-        // Also add matrix variables to env for convenience?
-        // The prompt says "matrix (ví dụ: một Map các biến môi trường)" -> implies they ARE env vars.
-        // So we should merge them into env.
+		
         for (k, v) in vars {
             env.insert(k.clone(), v.clone());
         }

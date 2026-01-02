@@ -219,12 +219,6 @@ fn expand_matrix(_name: &str, job_def: &WorkflowJob) -> Vec<(String, JobRequest)
                  let hash_suffix = hex::encode(result);
                  // Shorten hash to 8 chars
                  let short_hash = &hash_suffix[..8];
-
-                 // Readable suffix + Short Hash to avoid collision if values are similar but keys different?
-                 // Actually standard GH actions just uses values. 
-                 // But user suggested: "Use hash as suffix for internal ID, but keep display name readable".
-                 // Here we return the suffix used for the KEY in the map.
-                 // So let's use readable values + short hash for safety.
                  let suffix = format!("{}-{}", combo_str, short_hash);
                  
                  req.env = Some(env);

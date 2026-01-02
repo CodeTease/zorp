@@ -16,21 +16,6 @@ use crate::models::JobContext;
 use crate::queue::JobQueue;
 
 pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, queue: Arc<RedisQueue>, s3_client: aws_sdk_s3::Client, s3_bucket: String) -> tokio::task::JoinHandle<()> {
-    // 1. Event Stream Listener (Real-time) - Keeps running independently?
-    // The prompt says "Chia để trị Leader Election... Chỉ ông nào nắm giữ khóa Redis mới được quyền chạy task dọn dẹp hệ thống."
-    // This usually implies the periodic reaper, not necessarily the event listener which is local to the instance's docker daemon.
-    // However, if we have multiple dispatchers on the same machine (weird but possible) or different machines connecting to same remote docker?
-    // Usually Zorp manages its *local* docker. So Event Listener should run for *this* instance.
-    // The "Reaper" usually refers to the "Garbage Collector" and "Zombie Reaper" that might scan the DB and make global decisions.
-    // But `reap_zombies` lists *local* containers.
-    // `garbage_collection` lists *local* temp files and containers.
-    // So actually, if we have multiple instances on different machines, they MUST run their own reaper for local cleanup.
-    // BUT the prompt says "If you run 2-3 instances of Zorp dispatcher to load balance, Reapers will fight when cleaning up a container."
-    // This implies they share the Docker Daemon (e.g. connecting to a remote Docker swarm or same socket).
-    // If they share the same Docker Daemon, then yes, they fight.
-    // If they have separate Docker Daemons, they don't fight.
-    // Assuming Shared Docker Daemon or Shared DB where they might conflict on status updates.
-    // The prompt says "Leader Election using Redis".
 
     let docker_events = docker.clone();
     let db_events = db.clone();
