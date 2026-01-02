@@ -1,35 +1,71 @@
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
     StartContainerOptions, WaitContainerOptions, DownloadFromContainerOptions, ListContainersOptions,
-    StopContainerOptions, PruneContainersOptions,
+    StopContainerOptions, NetworkingConfig,
 };
-use bollard::image::{CreateImageOptions, PruneImagesOptions};
-use bollard::volume::PruneVolumesOptions;
-use bollard::models::HostConfig;
+use bollard::image::CreateImageOptions;
+use bollard::volume::{CreateVolumeOptions, ListVolumesOptions}; 
+use bollard::models::{HostConfig, EndpointSettings};
 use bollard::Docker;
 use futures_util::TryStreamExt; 
 use futures_util::StreamExt;    
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::io::{AsyncWriteExt, AsyncSeekExt, SeekFrom}; 
 use tracing::{info, warn, error};
-use crate::models::{JobContext, JobRegistry, StreamRegistry};
-use crate::db::{DbPool, sql_placeholder};
+use crate::models::{JobContext, JobRegistry, UploadTask, ServiceRequest};
+use crate::db::DbPool;
 use crate::queue::JobQueue;
 use crate::metrics;
-use tokio::sync::broadcast;
+use crate::streaming::RedisLogPublisher;
 use bollard::network::CreateNetworkOptions;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use hex;
+use uuid::Uuid;
+use crate::security;
+use crate::cache;
+use std::collections::HashMap;
 
 use aws_sdk_s3;
 
 const ZORP_NETWORK_NAME: &str = "zorp-net";
 
-// --- CANCEL JOB LOGIC ---
+fn check_image_policy(image: &str) -> Result<(), String> {
+    let allowed_images = std::env::var("ZORP_ALLOWED_IMAGES").unwrap_or_default();
+    if allowed_images.is_empty() {
+        return Ok(());
+    }
+    
+    use regex::Regex;
+    
+    for pattern in allowed_images.split(',') {
+        let pattern = pattern.trim();
+        if pattern.is_empty() { continue; }
+        
+        if pattern.starts_with("regex:") {
+            let re_str = pattern.trim_start_matches("regex:");
+            if let Ok(re) = Regex::new(re_str) {
+                if re.is_match(image) {
+                    return Ok(());
+                }
+            } else {
+                 warn!("Invalid regex policy: {}", re_str);
+            }
+        } else {
+            if pattern.ends_with('*') {
+                let prefix = pattern.trim_end_matches('*');
+                if image.starts_with(prefix) {
+                    return Ok(());
+                }
+            } else if image == pattern {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(format!("Image '{}' is not allowed by ZORP_ALLOWED_IMAGES policy.", image))
+}
+
 pub async fn cancel_job(
     docker: &Docker,
     registry: &JobRegistry,
@@ -44,7 +80,6 @@ pub async fn cancel_job(
     if let Some(container_id) = container_name {
         info!("Cancellation requested for job {}. Stopping container {} (Grace period: 10s)...", job_id, container_id);
 
-        // Graceful Cancellation: Stop container with timeout (SIGTERM -> SIGKILL)
         let stop_opts = StopContainerOptions { t: 10 }; 
         match docker.stop_container(&container_id, Some(stop_opts)).await {
             Ok(_) => {
@@ -52,123 +87,24 @@ pub async fn cancel_job(
             }
             Err(e) => {
                 warn!("Failed to gracefully stop container {}: {}. Attempting forced kill...", container_id, e);
-                // Fallback to kill if stop fails (e.g. timeout or error)
                 if let Err(k_e) = docker.kill_container::<String>(&container_id, None).await {
                      warn!("Failed to kill container {}: {}", container_id, k_e);
                 }
             }
         }
 
-        // Update DB status to CANCELLED
-        let query = format!("UPDATE jobs SET status = 'CANCELLED' WHERE id = {}", sql_placeholder(1));
-        if let Err(e) = sqlx::query(&query).bind(job_id).execute(db).await {
+        let mut q_builder = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'CANCELLED' WHERE id = ");
+        q_builder.push_bind(job_id);
+
+        if let Err(e) = q_builder.build().execute(db).await {
             error!("Failed to update job {} status to CANCELLED: {}", job_id, e);
         }
 
         return Ok(true);
     }
 
-    // Fallback: Check if it's in DB as RUNNING but not in registry (Zombie?)
-    // Or maybe just return false saying "Job not found running".
     warn!("Cancellation requested for job {}, but it was not found in active registry.", job_id);
     Ok(false)
-}
-
-// --- THE ZOMBIE REAPER & GARBAGE COLLECTOR ---
-pub fn spawn_reaper_task(docker: Docker, db: DbPool) {
-    tokio::spawn(async move {
-        info!("逐 Zombie Reaper & Garbage Collector task started.");
-        loop {
-            // Reap Zombies (every 60s)
-            reap_zombies(&docker, &db).await;
-            
-            // Garbage Collection (Temp files & Pruning)
-            garbage_collection(&docker).await;
-
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        }
-    });
-}
-
-async fn reap_zombies(docker: &Docker, db: &DbPool) {
-    let mut filters = std::collections::HashMap::new();
-    filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
-
-    let options = ListContainersOptions {
-        all: true,
-        filters,
-        ..Default::default()
-    };
-
-    if let Ok(containers) = docker.list_containers(Some(options)).await {
-        for c in containers {
-            let job_id = c.labels.as_ref()
-                .and_then(|l| l.get("job_id"))
-                .cloned();
-
-            if let Some(jid) = job_id {
-                 let query = format!("SELECT status FROM jobs WHERE id = {}", sql_placeholder(1));
-                 let row = sqlx::query_as::<_, (String,)>(&query)
-                     .bind(&jid)
-                     .fetch_optional(db).await;
-
-                 let should_kill = match row {
-                     Ok(Some((status,))) => status != "RUNNING" && status != "QUEUED",
-                     Ok(None) => true, // Job not in DB? Zombie.
-                     Err(_) => false,
-                 };
-
-                 if should_kill {
-                     if c.state.as_deref() == Some("running") {
-                         warn!("逐 Reaper: Found active zombie {} (Job {}). Terminating...", c.id.as_deref().unwrap_or("?"), jid);
-                         if let Some(id) = c.id.as_ref() {
-                            let _ = docker.kill_container::<String>(id, None).await;
-                         }
-                     }
-                     if let Some(id) = c.id.as_ref() {
-                        let _ = docker.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
-                     }
-                 }
-            }
-        }
-    }
-}
-
-async fn garbage_collection(docker: &Docker) {
-    // 1. Clean up stale /tmp files (logs & artifacts) older than 1 hour
-    let tmp_dir = std::path::Path::new("/tmp");
-    if let Ok(mut entries) = tokio::fs::read_dir(tmp_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("zorp-") {
-                    if let Ok(metadata) = entry.metadata().await {
-                        if let Ok(modified) = metadata.modified() {
-                            if let Ok(age) = SystemTime::now().duration_since(modified) {
-                                if age > std::time::Duration::from_secs(3600) {
-                                    info!("🧹 GC: Removing stale file {:?}", path);
-                                    let _ = tokio::fs::remove_file(path).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Prune Docker Resources
-    let mut filters = std::collections::HashMap::new();
-    filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
-    
-    // Prune containers
-    let _ = docker.prune_containers(Some(PruneContainersOptions { filters: filters.clone() })).await;
-
-    // Prune images (dangling)
-    let _ = docker.prune_images(Some(PruneImagesOptions::<String> { filters: std::collections::HashMap::new() })).await; 
-    
-    // Prune volumes
-    let _ = docker.prune_volumes(Some(PruneVolumesOptions::<String> { filters: std::collections::HashMap::new() })).await;
 }
 
 // --- DISPATCHER LOGIC ---
@@ -179,7 +115,6 @@ pub struct Dispatcher {
     http_client: reqwest::Client,
     limiter: Arc<Semaphore>,
     job_registry: JobRegistry,
-    stream_registry: StreamRegistry,
     s3_client: Option<aws_sdk_s3::Client>,
     s3_bucket: Option<String>,
     secret_key: String,
@@ -193,7 +128,6 @@ impl Dispatcher {
         http_client: reqwest::Client, 
         max_concurrent: usize,
         job_registry: JobRegistry,
-        stream_registry: StreamRegistry,
         s3_client: aws_sdk_s3::Client,
         s3_bucket: String,
         secret_key: String,
@@ -205,12 +139,59 @@ impl Dispatcher {
             http_client,
             limiter: Arc::new(Semaphore::new(max_concurrent)),
             job_registry,
-            stream_registry,
             s3_client: Some(s3_client),
             s3_bucket: Some(s3_bucket),
             secret_key,
             queue,
         }
+    }
+
+    pub async fn reconcile_state(&self) -> Result<(), String> {
+        info!("Starting reconciliation...");
+        let containers = self.docker.list_containers(Some(ListContainersOptions {
+            filters: HashMap::from([("label".to_string(), vec!["managed_by=zorp".to_string()])]),
+            ..Default::default()
+        })).await.map_err(|e| format!("Failed to list containers: {}", e))?;
+
+        for c in containers {
+            if let Some(names) = c.names {
+                // Docker names start with slash usually, e.g. /zorp-uuid
+                let name = names.first().ok_or("No name")?.trim_start_matches('/');
+                
+                // Get Job ID from Label
+                let job_id = if let Some(labels) = c.labels.as_ref() {
+                    labels.get("job_id").cloned()
+                } else {
+                    None
+                };
+
+                if let Some(id) = job_id {
+                    // Update Registry
+                    info!("Adopting orphaned container: {} (Job ID: {})", name, id);
+                    {
+                        let mut reg = self.job_registry.write().await;
+                        reg.insert(id.clone(), name.to_string());
+                    }
+
+                    // We should also ideally re-attach log streaming here if we want full recovery,
+                    // but for now we at least ensure we can CANCEL it and track it.
+                    // If the original process died, the log streaming loop died.
+                    // Re-attaching logs:
+                    let docker = self.docker.clone();
+                    let container_name = name.to_string();
+                    let job_id_clone = id.clone();
+                    let redis_client = self.queue.get_client();
+                    let log_publisher = RedisLogPublisher::new(redis_client);
+                    
+                    // Spawn a log streamer just in case it's still running
+                    tokio::spawn(async move {
+                        // We assume it's running. If it exits, this returns.
+                         stream_logs_to_file_and_broadcast(&docker, &container_name, &job_id_clone, &log_publisher).await;
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn dispatch(&self, job: JobContext) {
@@ -219,7 +200,6 @@ impl Dispatcher {
         let db = self.db.clone();
         let http_client = self.http_client.clone();
         let job_registry = self.job_registry.clone();
-        let stream_registry = self.stream_registry.clone();
         let s3_client = self.s3_client.clone();
         let s3_bucket = self.s3_bucket.clone();
         let secret_key = self.secret_key.clone();
@@ -232,6 +212,12 @@ impl Dispatcher {
 
             let start_time = Instant::now();
             let container_name = format!("zorp-{}", job.id);
+            
+            // Redis Publisher for logs (Reuse client from queue)
+            // We need to cast the Arc<dyn JobQueue> to RedisQueue if possible, or extend the trait to return the client.
+            // I extended the trait to have `get_client()`.
+            let redis_client = queue.get_client();
+            let log_publisher = RedisLogPublisher::new(redis_client);
 
             // Register job for cancellation
             {
@@ -239,21 +225,27 @@ impl Dispatcher {
                 reg.insert(job.id.clone(), container_name.clone());
             }
 
-            // Create broadcast channel for streaming logs
-            let (tx, _) = broadcast::channel(100);
-            {
-                let mut s_reg = stream_registry.write().await;
-                s_reg.insert(job.id.clone(), tx.clone());
-            }
-
             // Dynamic SQL: UPDATE jobs SET status = 'RUNNING' WHERE id = $1
-            let update_running = format!("UPDATE jobs SET status = 'RUNNING' WHERE id = {}", sql_placeholder(1));
-            let _ = sqlx::query(&update_running)
-                .bind(&job.id)
-                .execute(&db).await;
+            let mut q_running = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'RUNNING' WHERE id = ");
+            q_running.push_bind(&job.id);
+            
+            let _ = q_running.build().execute(&db).await;
 
             info!("[{}] Status: RUNNING", job.id);
-            let _ = tx.send(format!("INFO: Job {} started.\n", job.id));
+            let _ = log_publisher.publish(&job.id, &format!("INFO: Job {} started.\n", job.id)).await;
+
+            // Start Heartbeat Loop
+            let queue_for_heartbeat = queue.clone();
+            let job_id_for_heartbeat = job.id.clone();
+            // We use a cancellation token or just abort handle for the heartbeat task
+            let heartbeat_handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    if let Err(e) = queue_for_heartbeat.update_heartbeat(&job_id_for_heartbeat).await {
+                         warn!("[{}] Failed to update heartbeat: {}", job_id_for_heartbeat, e);
+                    }
+                }
+            });
 
             let mut final_status = "FINISHED";
             let mut final_exit_code = 0;
@@ -266,13 +258,40 @@ impl Dispatcher {
                 map.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
             });
 
-            let memory = job.limits.as_ref()
+            // Resource Limits (Hard Limits or Defaults)
+            let default_mem_mb = std::env::var("ZORP_DEFAULT_MEMORY_MB")
+                .ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(256);
+            let default_cpu_cores = std::env::var("ZORP_DEFAULT_CPU_CORES")
+                .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+
+            // Global Max Limits (Security)
+            let max_mem_mb = std::env::var("ZORP_MAX_MEMORY_MB")
+                .ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(2048); // Default 2GB max
+            let max_cpu_cores = std::env::var("ZORP_MAX_CPU_CORES")
+                .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(2.0); // Default 2 cores max
+
+            let mut req_mem_mb = job.limits.as_ref()
                 .and_then(|l| l.memory_mb)
-                .map(|mb| mb * 1024 * 1024);
+                .unwrap_or(default_mem_mb);
             
-            let cpu_quota = job.limits.as_ref()
+            let mut req_cpu_cores = job.limits.as_ref()
                 .and_then(|l| l.cpu_cores)
-                .map(|cores| (cores * 100000.0) as i64);
+                .unwrap_or(default_cpu_cores);
+
+            // Enforce Max Limits
+            if req_mem_mb > max_mem_mb {
+                 warn!("[{}] Requested Memory {}MB exceeds global limit {}MB. Clamping.", job.id, req_mem_mb, max_mem_mb);
+                 req_mem_mb = max_mem_mb;
+            }
+            if req_cpu_cores > max_cpu_cores {
+                 warn!("[{}] Requested CPU {} exceeds global limit {}. Clamping.", job.id, req_cpu_cores, max_cpu_cores);
+                 req_cpu_cores = max_cpu_cores;
+            }
+
+            info!("[{}] Enforcing Resource Limits: Mem={}MB, CPU={}", job.id, req_mem_mb, req_cpu_cores);
+
+            let memory = req_mem_mb * 1024 * 1024;
+            let cpu_quota = (req_cpu_cores * 100000.0) as i64;
 
             // Ensure Network Exists
             if let Err(_) = docker.inspect_network::<String>(ZORP_NETWORK_NAME, None).await {
@@ -284,9 +303,127 @@ impl Dispatcher {
                 }).await;
             }
 
-            if let Err(e) = ensure_image(&docker, &job.image).await {
+            // --- SPIN UP SERVICE CONTAINERS ---
+            let mut service_containers = Vec::new();
+            let mut service_error = None;
+
+            for service in &job.services {
+                info!("[{}] Starting service container: {} (Image: {})", job.id, service.alias, service.image);
+                
+                if let Err(e) = ensure_image(&docker, &service.image).await {
+                    error!("[{}] Service image pull failed: {}", job.id, e);
+                    service_error = Some(format!("Service {} failed: {}", service.alias, e));
+                    break;
+                }
+
+                let service_name = format!("zorp-svc-{}-{}", job.id, service.alias);
+                let mut svc_endpoints = HashMap::new();
+                svc_endpoints.insert(ZORP_NETWORK_NAME.to_string(), EndpointSettings {
+                    aliases: Some(vec![service.alias.clone()]),
+                    ..Default::default()
+                });
+
+                let svc_env: Option<Vec<String>> = service.env.as_ref().map(|map| {
+                    map.iter().map(|(k, v)| format!("{}={}", k, v)).collect()
+                });
+
+                let svc_config = Config {
+                    image: Some(service.image.clone()),
+                    cmd: service.command.clone(),
+                    env: svc_env,
+                    hostname: Some(service.alias.clone()),
+                    networking_config: Some(NetworkingConfig {
+                        endpoints_config: svc_endpoints,
+                    }),
+                    host_config: Some(HostConfig {
+                        network_mode: Some(ZORP_NETWORK_NAME.to_string()),
+                        auto_remove: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                match docker.create_container(
+                    Some(CreateContainerOptions { name: service_name.as_str(), platform: None }), 
+                    svc_config
+                ).await {
+                    Ok(_) => {
+                        if let Err(e) = docker.start_container::<String>(&service_name, None).await {
+                             error!("[{}] Failed to start service {}: {}", job.id, service.alias, e);
+                             service_error = Some(format!("Failed to start service {}: {}", service.alias, e));
+                             break;
+                        } else {
+                            service_containers.push(service_name);
+                        }
+                    },
+                    Err(e) => {
+                        error!("[{}] Failed to create service {}: {}", job.id, service.alias, e);
+                        service_error = Some(format!("Failed to create service {}: {}", service.alias, e));
+                        break;
+                    }
+                }
+            }
+
+            // Input Validation & Policy Check
+            // --- HOT VOLUMES (CACHING) ---
+            // Move cache logic OUTSIDE of validation/image check blocks to ensure it scopes correctly for later use
+            let mut binds = Vec::new();
+            let host_cache_path = if let Some(cache_key) = &job.cache_key {
+                let path = std::path::PathBuf::from(format!("/tmp/zorp-cache/{}", cache_key));
+                
+                // Restore Cache from S3
+                if let (Some(s3_client), Some(bucket)) = (&s3_client, &s3_bucket) {
+                    if let Err(e) = cache::restore_cache(s3_client, bucket, cache_key, &path).await {
+                        warn!("[{}] Failed to restore cache: {}", job.id, e);
+                    } else {
+                        info!("[{}] Cache restored successfully.", job.id);
+                    }
+                }
+
+                // Create dir if not exists (in case S3 restore failed or was empty)
+                if !path.exists() {
+                        let _ = tokio::fs::create_dir_all(&path).await;
+                }
+
+                if let Some(paths) = &job.cache_paths {
+                    for container_path in paths {
+                        // Use Bind Mount from Host Path
+                        binds.push(format!("{}:{}", path.to_string_lossy(), container_path));
+                    }
+                }
+                Some(path)
+            } else {
+                None
+            };
+            
+            let mut validation_error = None;
+            if let Some(url) = &job.callback_url {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                     validation_error = Some("Callback URL must start with http:// or https://".to_string());
+                }
+            }
+
+            if let Some(err) = service_error {
+                 error!("[{}] Service Startup Failed: {}", job.id, err);
+                 let _ = log_publisher.publish(&job.id, &format!("ERROR: Service Startup Failed: {}\n", err)).await;
+                 final_status = "FAILED";
+                 final_exit_code = -1;
+                 webhook_logs = format!("Service Error: {}", err);
+            } else if let Some(err) = validation_error {
+                 error!("[{}] Input Validation Failed: {}", job.id, err);
+                 let _ = log_publisher.publish(&job.id, &format!("ERROR: Input Validation Failed: {}\n", err)).await;
+                 final_status = "FAILED";
+                 final_exit_code = -1;
+                 webhook_logs = format!("Security Error: {}", err);
+            } else if let Err(policy_err) = check_image_policy(&job.image) {
+                 error!("[{}] Image Policy Violation: {}", job.id, policy_err);
+                 let _ = log_publisher.publish(&job.id, &format!("ERROR: Image Policy Violation: {}\n", policy_err)).await;
+                 final_status = "FAILED";
+                 final_exit_code = -1;
+                 webhook_logs = format!("Security Error: {}", policy_err);
+            } else if let Err(e) = ensure_image(&docker, &job.image).await {
                 error!("[{}] Image pull failed: {}", job.id, e);
-                let _ = tx.send(format!("ERROR: Image pull failed: {}\n", e));
+                let _ = log_publisher.publish(&job.id, &format!("ERROR: Image pull failed: {}\n", e)).await;
                 final_status = "FAILED";
                 final_exit_code = -1;
                 webhook_logs = format!("System Error: Image pull failed. {}", e);
@@ -294,6 +431,9 @@ impl Dispatcher {
                 let mut labels = std::collections::HashMap::new();
                 labels.insert("managed_by".to_string(), "zorp".to_string());
                 labels.insert("job_id".to_string(), job.id.clone());
+                if job.debug {
+                    labels.insert("zorp_debug".to_string(), "true".to_string());
+                }
 
                 let config = Config {
                     image: Some(job.image.clone()),
@@ -302,16 +442,19 @@ impl Dispatcher {
                     labels: Some(labels),
                     host_config: Some(HostConfig {
                         auto_remove: Some(false), 
-                        memory: memory.or(Some(1024 * 1024 * 512)), 
-                        cpu_quota: cpu_quota.or(Some(100000)),
+                        memory: Some(memory), 
+                        cpu_quota: Some(cpu_quota),
                         // Security Context
                         readonly_rootfs: Some(true),
                         cap_drop: Some(vec!["ALL".to_string()]),
-                        pids_limit: Some(100),
+                        pids_limit: Some(std::env::var("ZORP_PIDS_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(100)),
+                        // Tini init for proper signal handling (PID 1 zombie reaping)
+                        init: Some(true),
                         // Network Isolation
-                        network_mode: Some(ZORP_NETWORK_NAME.to_string()),
+                        network_mode: if job.enable_network { Some(ZORP_NETWORK_NAME.to_string()) } else { Some("none".to_string()) },
                         // Extra Hosts: Block metadata service
                         extra_hosts: Some(vec!["169.254.169.254:127.0.0.1".to_string()]),
+                        binds: Some(binds), // Added Binds for Volumes
                         ..Default::default()
                     }),
                     // Configurable User
@@ -327,13 +470,42 @@ impl Dispatcher {
                     config
                 ).await {
                     Ok(_) => {
-                        if let Err(e) = docker.start_container(&container_name, None::<StartContainerOptions<String>>).await {
-                             error!("[{}] Start failed: {}", job.id, e);
-                             let _ = tx.send(format!("ERROR: Container start failed: {}\n", e));
+                        // --- RETRY LOGIC START ---
+                        let mut start_attempts = 0;
+                        let max_retries = 3;
+                        let mut start_result = Err(bollard::errors::Error::DockerResponseServerError {
+                            status_code: 500,
+                            message: "Initial attempt".to_string(),
+                        }); // Dummy error to init
+
+                        while start_attempts < max_retries {
+                             start_result = docker.start_container(&container_name, None::<StartContainerOptions<String>>).await;
+                             if start_result.is_ok() {
+                                 break;
+                             }
+                             start_attempts += 1;
+                             warn!("[{}] Start failed (Attempt {}/{}): {:?}", job.id, start_attempts, max_retries, start_result.as_ref().err());
+                             tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(start_attempts as u32))).await;
+                        }
+                        // --- RETRY LOGIC END ---
+
+                        if let Err(e) = start_result {
+                             error!("[{}] Start failed after retries: {}", job.id, e);
+                             let _ = log_publisher.publish(&job.id, &format!("ERROR: Container start failed: {}\n", e)).await;
                              final_status = "FAILED";
                              final_exit_code = -2;
                              webhook_logs = format!("Error: Start failed: {}", e);
                         } else {
+                            // Spawn log streaming in a separate task
+                            let docker_log = docker.clone();
+                            let container_name_log = container_name.clone();
+                            let job_id_log = job.id.clone();
+                            let log_publisher_log = log_publisher.clone();
+                            
+                            let log_handle = tokio::spawn(async move {
+                                stream_logs_to_file_and_broadcast(&docker_log, &container_name_log, &job_id_log, &log_publisher_log).await
+                            });
+
                             // Wait logic with Timeout
                             let mut wait_stream = docker.wait_container(
                                 &container_name, 
@@ -356,11 +528,11 @@ impl Dispatcher {
                                         Some(Ok(r)) => {
                                             final_exit_code = r.status_code as i32;
                                             info!("[{}] Container exited with {}", job.id, final_exit_code);
-                                            let _ = tx.send(format!("INFO: Container exited with code {}\n", final_exit_code));
+                                            let _ = log_publisher.publish(&job.id, &format!("INFO: Container exited with code {}\n", final_exit_code)).await;
                                         }
                                         Some(Err(e)) => {
                                             error!("[{}] Wait stream error: {}", job.id, e);
-                                            let _ = tx.send(format!("ERROR: Wait stream error: {}\n", e));
+                                            let _ = log_publisher.publish(&job.id, &format!("ERROR: Wait stream error: {}\n", e)).await;
                                             final_status = "FAILED";
                                             final_exit_code = -99;
                                         }
@@ -378,18 +550,24 @@ impl Dispatcher {
                                 _ = timeout_fut => {
                                     // Timeout
                                     info!("[{}] Timeout reached. Killing...", job.id);
-                                    let _ = tx.send("ERROR: Timeout reached. Killing container.\n".to_string());
+                                    let _ = log_publisher.publish(&job.id, "ERROR: Timeout reached. Killing container.\n").await;
                                     let _ = docker.kill_container::<String>(&container_name, None).await;
                                     final_status = "TIMED_OUT";
                                 }
                             }
 
-                            // Collect logs to file (and stream)
-                            log_file_path = stream_logs_to_file_and_broadcast(&docker, &container_name, &job.id, &tx).await;
+                            // Wait for log streaming to finish
+                            log_file_path = match log_handle.await {
+                                Ok(path) => path,
+                                Err(e) => {
+                                    error!("Log stream task panicked or cancelled: {}", e);
+                                    String::new()
+                                }
+                            };
 
                             // Collect Artifacts
                             if let Some(art_path) = &job.artifacts_path {
-                                let _ = tx.send("INFO: Collecting artifacts...\n".to_string());
+                                let _ = log_publisher.publish(&job.id, "INFO: Collecting artifacts...\n").await;
                                 let options = Some(DownloadFromContainerOptions { path: art_path.clone() });
                                 let mut stream = docker.download_from_container(&container_name, options);
 
@@ -410,46 +588,57 @@ impl Dispatcher {
                                     }
 
                                     if success {
-                                        if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
+                                        // Decoupled Artifact Upload
+                                        if let Some(bucket) = s3_bucket.as_ref() {
                                             let key = format!("artifacts/{}.tar", job.id);
-                                             match aws_sdk_s3::primitives::ByteStream::from_path(path_ref).await {
-                                                 Ok(bs) => {
-                                                     if let Ok(_) = s3.put_object().bucket(bucket).key(&key).body(bs).send().await {
-                                                         final_artifact_url = format!("s3://{}/{}", bucket, key);
-                                                         info!("[{}] Artifact uploaded: {}", job.id, final_artifact_url);
-                                                         let _ = tx.send(format!("INFO: Artifact uploaded to {}\n", final_artifact_url));
-                                                     }
-                                                 },
-                                                 Err(e) => error!("Failed to read artifact file: {}", e)
-                                             }
+                                            final_artifact_url = format!("s3://{}/{}", bucket, key);
+                                            
+                                            let task = UploadTask {
+                                                job_id: job.id.clone(),
+                                                file_path: art_file_path.clone(),
+                                                upload_type: "artifact".to_string(),
+                                                s3_key: key,
+                                                retry_count: 0,
+                                            };
+                                            
+                                            info!("[{}] Enqueuing artifact upload...", job.id);
+                                            if let Err(e) = queue.enqueue_upload(task).await {
+                                                error!("[{}] Failed to enqueue artifact upload: {}", job.id, e);
+                                            }
                                         }
                                     }
-                                    let _ = tokio::fs::remove_file(path_ref).await;
+                                    // Do NOT remove file here. UploadWorker will remove it.
+                                    // let _ = tokio::fs::remove_file(path_ref).await;
                                 }
                             }
                         }
                     }
                     Err(e) => {
                          error!("[{}] Create failed: {}", job.id, e);
-                         let _ = tx.send(format!("ERROR: Create container failed: {}\n", e));
+                         let _ = log_publisher.publish(&job.id, &format!("ERROR: Create container failed: {}\n", e)).await;
                         final_status = "FAILED";
                         final_exit_code = -3;
                         webhook_logs = format!("Error: Container creation failed: {}", e);
                     }
                 }
 
-                let _ = docker.remove_container(&container_name, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+                if !job.debug {
+                    let _ = docker.remove_container(&container_name, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+                } else {
+                    info!("[{}] Debug mode enabled. Container kept.", job.id);
+                }
+            }
+
+            // Cleanup Service Containers
+            for svc_name in service_containers {
+                info!("[{}] Cleaning up service: {}", job.id, svc_name);
+                let _ = docker.remove_container(&svc_name, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
             }
 
             // Clean up registry
             {
                 let mut reg = job_registry.write().await;
                 reg.remove(&job.id);
-            }
-            // Clean up stream registry
-            {
-                let mut s_reg = stream_registry.write().await;
-                s_reg.remove(&job.id);
             }
 
             if final_status != "TIMED_OUT" && final_status != "FAILED" && final_exit_code != 0 {
@@ -458,8 +647,190 @@ impl Dispatcher {
                  final_status = "FAILED";
             }
 
+            // --- SAVE CACHE ---
+            if let (Some(host_path), Some(cache_key)) = (host_cache_path, &job.cache_key) {
+                if final_status != "FAILED" && final_status != "TIMED_OUT" && final_status != "CANCELLED" {
+                    if let (Some(s3_client), Some(bucket)) = (&s3_client, &s3_bucket) {
+                         if let Err(e) = cache::save_cache(s3_client, bucket, cache_key, &host_path).await {
+                             warn!("[{}] Failed to save cache: {}", job.id, e);
+                         } else {
+                             info!("[{}] Cache saved successfully.", job.id);
+                         }
+                    }
+                }
+                // Cleanup local cache dir to save space
+                let _ = tokio::fs::remove_dir_all(&host_path).await;
+            }
+
+            // --- JOB CHAINING (DAG & Fan-in) ---
+            if final_exit_code == 0 && final_status != "FAILED" && final_status != "TIMED_OUT" && final_status != "CANCELLED" {
+                // 1. Existing Legacy Behavior (Nested on_success)
+                if !job.on_success.is_empty() {
+                    info!("[{}] Triggering {} downstream jobs (Legacy Nested)...", job.id, job.on_success.len());
+                    for next_req in &job.on_success {
+                        let next_id = Uuid::new_v4().to_string();
+                        // Persist to DB first
+                        // Inherit user_id from parent if not specified
+                        let next_user_id = next_req.user.clone().or(job.user.clone());
+                        let cmds_json = serde_json::to_string(&next_req.commands).unwrap_or_default();
+
+                        let mut q_insert = sqlx::query_builder::QueryBuilder::new("INSERT INTO jobs (id, status, image, commands, callback_url, user_id) VALUES (");
+                        q_insert.push_bind(&next_id);
+                        q_insert.push(", 'QUEUED', ");
+                        q_insert.push_bind(&next_req.image);
+                        q_insert.push(", ");
+                        q_insert.push_bind(cmds_json);
+                        q_insert.push(", ");
+                        q_insert.push_bind(&next_req.callback_url);
+                        q_insert.push(", ");
+                        q_insert.push_bind(&next_user_id);
+                        q_insert.push(")");
+
+                        let insert_result = q_insert.build().execute(&db).await;
+                        
+                        if let Ok(_) = insert_result {
+                            let next_context = JobContext {
+                                id: next_id.clone(),
+                                image: next_req.image.clone(),
+                                commands: next_req.commands.clone(),
+                                env: next_req.env.clone(),
+                                limits: next_req.limits.clone().map(Arc::new),
+                                callback_url: next_req.callback_url.clone(),
+                                timeout_seconds: next_req.timeout_seconds,
+                                artifacts_path: next_req.artifacts_path.clone(),
+                                user: next_user_id,
+                                cache_key: next_req.cache_key.clone(),
+                                cache_paths: next_req.cache_paths.clone(),
+                                services: next_req.services.clone(), // Propagate services
+                                on_success: next_req.on_success.clone(),
+                                debug: next_req.debug,
+                                priority: next_req.priority.clone(),
+                                retry_count: 0,
+                                enable_network: next_req.enable_network, // Propagate network setting
+                                run_at: next_req.run_at,
+                        stream_id: None,
+                        stream_name: None,
+                            };
+                            
+                            if let Err(e) = queue.enqueue(next_context).await {
+                                error!("[{}] Failed to enqueue chained job {}: {}", job.id, next_id, e);
+                            } else {
+                                info!("[{}] Enqueued chained job: {}", job.id, next_id);
+                            }
+                        } else {
+                             error!("[{}] Failed to persist chained job {}: {:?}", job.id, next_id, insert_result.err());
+                        }
+                    }
+                }
+
+                // 2. New DAG Behavior (Flattened Dependencies)
+                // Find children in job_dependencies table
+                #[derive(sqlx::FromRow)]
+                struct ChildJobId { child_job_id: String }
+
+                let mut q_children = sqlx::query_builder::QueryBuilder::new("SELECT child_job_id FROM job_dependencies WHERE parent_job_id = ");
+                q_children.push_bind(&job.id);
+
+                let children_result = q_children.build_query_as::<ChildJobId>()
+                    .fetch_all(&db).await;
+
+                if let Ok(children) = children_result {
+                    for child in children {
+                        // Atomic Update: Increment met dependencies
+                        // We need to return the new value to check if it matches total needed
+                        // But wait, we need to know the Total Needed.
+                        // We can query: SELECT COUNT(*) FROM job_dependencies WHERE child_job_id = $1
+                        
+                        let child_id = child.child_job_id;
+                        
+                        // Transaction-like logic
+                        let mut tx = db.begin().await.ok(); 
+                        if let Some(mut transaction) = tx {
+                            // 1. Increment dependencies_met
+                            let _ = sqlx::query("UPDATE jobs SET dependencies_met = dependencies_met + 1 WHERE id = ?")
+                                .bind(&child_id)
+                                .execute(&mut *transaction).await;
+                                
+                            // 2. Check if ready
+                            // Get current met
+                            let row_job = sqlx::query_as::<_, (i32,)>("SELECT dependencies_met FROM jobs WHERE id = ?")
+                                .bind(&child_id)
+                                .fetch_optional(&mut *transaction).await;
+                                
+                            // Get total required
+                            let row_count = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM job_dependencies WHERE child_job_id = ?")
+                                .bind(&child_id)
+                                .fetch_one(&mut *transaction).await;
+
+                            if let (Ok(Some((met,))), Ok((total,))) = (row_job, row_count) {
+                                if met as i64 >= total {
+                                    // Ready to run!
+                                    // Fetch the job details to enqueue
+                                    #[derive(sqlx::FromRow)]
+                                    struct JobRow {
+                                        id: String,
+                                        image: String,
+                                        commands: String, // JSON
+                                        env: Option<String>, // JSON
+                                        services: Option<String>, // JSON
+                                        callback_url: Option<String>,
+                                        user_id: Option<String>,
+                                        enable_network: bool,
+                                        artifacts_path: Option<String>,
+                                        cache_key: Option<String>,
+                                    }
+                                    
+                                    let job_data = sqlx::query_as::<_, JobRow>("SELECT id, image, commands, env, services, callback_url, user_id, enable_network, artifacts_path, cache_key FROM jobs WHERE id = ?")
+                                         .bind(&child_id)
+                                         .fetch_optional(&mut *transaction).await;
+                                         
+                                    if let Ok(Some(j)) = job_data {
+                                        let _ = sqlx::query("UPDATE jobs SET status = 'QUEUED' WHERE id = ?")
+                                            .bind(&child_id)
+                                            .execute(&mut *transaction).await;
+                                            
+                                        let context = JobContext {
+                                            id: j.id.clone(),
+                                            image: j.image,
+                                            commands: serde_json::from_str(&j.commands).unwrap_or_default(),
+                                            env: j.env.and_then(|s| serde_json::from_str(&s).ok()),
+                                            limits: None,
+                                            callback_url: j.callback_url,
+                                            timeout_seconds: None,
+                                            artifacts_path: j.artifacts_path,
+                                            user: j.user_id,
+                                            cache_key: j.cache_key,
+                                            cache_paths: None,
+                                            services: j.services.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
+                                            on_success: vec![],
+                                            debug: false,
+                                            priority: None,
+                                            retry_count: 0,
+                                            enable_network: j.enable_network,
+                                            run_at: None,
+                                            stream_id: None,
+                                            stream_name: None,
+                                        };
+                                        
+                                        if let Err(e) = queue.enqueue(context).await {
+                                            error!("[{}] Failed to enqueue child job {}: {}", job.id, child_id, e);
+                                        } else {
+                                            info!("[{}] Enqueued child job: {}", job.id, child_id);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            let _ = transaction.commit().await;
+                        } else {
+                             error!("Failed to begin transaction for dependency update");
+                        }
+                    }
+                }
+            }
+
             if final_status == "FAILED" || final_status == "TIMED_OUT" || final_status == "CANCELLED" {
-                metrics::inc_failed();
+                metrics::inc_failed(final_status);
             } else {
                 metrics::inc_completed();
             }
@@ -467,68 +838,61 @@ impl Dispatcher {
 
             let duration = start_time.elapsed().as_secs_f64();
 
-            // --- LOGS PERSISTENCE (MANDATORY S3) ---
-            let mut final_log_ref = String::new();
-
-            // If we have a log file, process it
+            // --- LOGS PERSISTENCE (DECOUPLED VIA REDIS QUEUE) ---
+            // If we have a log file, enqueue for upload
             if !log_file_path.is_empty() {
-                if let (Some(s3), Some(bucket)) = (s3_client.as_ref(), s3_bucket.as_ref()) {
-                    let key = format!("logs/{}.txt", job.id);
-                    let path_ref = std::path::Path::new(&log_file_path);
-
-                    match aws_sdk_s3::primitives::ByteStream::from_path(path_ref).await {
-                        Ok(byte_stream) => {
-                            info!("[{}] Uploading logs to S3...", job.id);
-                            match s3.put_object().bucket(bucket).key(&key).body(byte_stream).send().await {
-                                Ok(_) => {
-                                    final_log_ref = format!("s3://{}/{}", bucket, key);
-                                    webhook_logs = final_log_ref.clone(); // Webhook gets the URL
-                                    info!("[{}] S3 upload successful.", job.id);
-                                }
-                                Err(e) => {
-                                    error!("S3 upload failed: {}", e);
-                                    final_status = "FAILED"; // Mark job as failed if logs cannot be preserved
-                                    webhook_logs = format!("System Error: Log upload failed. {}", e);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            error!("Failed to read log file for S3 upload: {}", e);
-                            final_status = "FAILED";
-                        }
-                    }
-                } else {
-                    error!("S3 Client not available despite being mandatory!");
-                    final_status = "FAILED";
+                let key = format!("logs/{}.txt", job.id);
+                // Construct S3 URL proactively for Webhook, even if not uploaded yet (Optimistic)
+                if let Some(bucket) = &s3_bucket {
+                    webhook_logs = format!("s3://{}/{}", bucket, key);
                 }
 
-                // Remove temp file
-                let _ = tokio::fs::remove_file(&log_file_path).await;
+                let task = UploadTask {
+                    job_id: job.id.clone(),
+                    file_path: log_file_path.clone(),
+                    upload_type: "log".to_string(),
+                    s3_key: key,
+                    retry_count: 0,
+                };
+
+                info!("[{}] Enqueuing log upload...", job.id);
+                if let Err(e) = queue.enqueue_upload(task).await {
+                    error!("[{}] Failed to enqueue log upload: {}", job.id, e);
+                }
             } else if final_status != "FAILED" && final_status != "CANCELLED" {
-                // No logs generated?
                 warn!("[{}] No logs were generated or captured.", job.id);
             }
+            
+            let mut q_final = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = ");
+            q_final.push_bind(final_status);
+            q_final.push(", exit_code = ");
+            q_final.push_bind(final_exit_code);
+            q_final.push(", logs = ");
+            q_final.push_bind(&webhook_logs);
+            q_final.push(", artifact_url = ");
+            q_final.push_bind(&final_artifact_url);
+            q_final.push(" WHERE id = ");
+            q_final.push_bind(&job.id);
+            q_final.push(" AND status != 'CANCELLED'");
 
-            // Dynamic SQL: UPDATE jobs SET status = $1, exit_code = $2, logs = $3, artifact_url = $4 WHERE id = $5
-            let update_final = format!(
-                "UPDATE jobs SET status = {}, exit_code = {}, logs = {}, artifact_url = {} WHERE id = {}",
-                sql_placeholder(1), sql_placeholder(2), sql_placeholder(3), sql_placeholder(4), sql_placeholder(5)
-            );
-
-            if let Err(e) = sqlx::query(&update_final)
-                .bind(final_status)
-                .bind(final_exit_code)
-                .bind(&final_log_ref)
-                .bind(&final_artifact_url)
-                .bind(&job.id)
-                .execute(&db).await 
-            {
-                error!("[{}] DB Update failed: {}", job.id, e);
+            match q_final.build().execute(&db).await {
+                Ok(result) => {
+                    if result.rows_affected() == 0 {
+                         warn!("[{}] Job was CANCELLED (or not found) during execution. Final update skipped.", job.id);
+                         final_status = "CANCELLED"; // Correct local status for webhook/metrics if needed
+                    }
+                },
+                Err(e) => {
+                    error!("[{}] DB Update failed: {}", job.id, e);
+                }
             }
 
             info!("[{}] Status: {} (Exit: {}). Time: {:.2}s", job.id, final_status, final_exit_code, duration);
 
             // Acknowledge the job in the queue (Remove from processing queue)
+            // Stop heartbeat
+            heartbeat_handle.abort();
+
             if let Err(e) = queue.acknowledge(&job).await {
                 error!("[{}] Failed to acknowledge job in queue: {}", job.id, e);
             } else {
@@ -536,43 +900,22 @@ impl Dispatcher {
             }
 
             if let Some(url) = job.callback_url {
-                let payload = serde_json::json!({
+                // Use the new Webhook Queue instead of direct call
+                let webhook_payload = serde_json::json!({
                     "job_id": job.id,
                     "status": final_status,
                     "exit_code": final_exit_code,
                     "duration_seconds": duration,
-                    "logs": webhook_logs
+                    "logs": webhook_logs,
+                    "callback_url": url,
+                    "attempt": 0
                 });
 
-                // SIGNATURE GENERATION
-                let mut headers = reqwest::header::HeaderMap::new();
-                if let Ok(payload_str) = serde_json::to_string(&payload) {
-                     type HmacSha256 = Hmac<Sha256>;
-                     if let Ok(mut mac) = HmacSha256::new_from_slice(secret_key.as_bytes()) {
-                         mac.update(payload_str.as_bytes());
-                         let result = mac.finalize();
-                         let signature = hex::encode(result.into_bytes());
-                         if let Ok(hv) = reqwest::header::HeaderValue::from_str(&signature) {
-                             headers.insert("X-Zorp-Signature", hv);
-                         }
-                     }
-                }
-
-                let send_result = http_client.post(&url)
-                    .headers(headers.clone())
-                    .json(&payload)
-                    .send()
-                    .await;
-                
-                if let Err(e) = send_result {
-                     warn!("[{}] Webhook failed (1/2): {}. Retrying...", job.id, e);
-                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                     let _ = http_client.post(&url)
-                         .headers(headers)
-                         .json(&payload)
-                         .send()
-                         .await
-                         .map_err(|e2| error!("[{}] Webhook failed (2/2): {}", job.id, e2));
+                if let Ok(json_str) = serde_json::to_string(&webhook_payload) {
+                    info!("[{}] Enqueuing webhook callback...", job.id);
+                    if let Err(e) = queue.enqueue_webhook(json_str).await {
+                        error!("[{}] Failed to enqueue webhook: {}", job.id, e);
+                    }
                 }
             }
         });
@@ -589,7 +932,7 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<(), bollard::error
     Ok(())
 }
 
-async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: &str, tx: &broadcast::Sender<String>) -> String {
+async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: &str, publisher: &RedisLogPublisher) -> String {
     let filename = format!("/tmp/zorp-{}.log", job_id);
     let path = std::path::Path::new(&filename);
 
@@ -605,6 +948,13 @@ async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: 
         stdout: true, stderr: true, follow: true, tail: "all".to_string(), ..Default::default()
     });
     let mut stream = docker.logs(name, options);
+    
+    let mut total_bytes_written: u64 = 0;
+    let mut current_file_size: u64 = 0;
+    
+    // Limits
+    const LOG_ROTATION_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
+    const LOG_HARD_LIMIT: u64 = 50 * 1024 * 1024; // 50MB (Total throughput)
 
     while let Ok(Some(log)) = stream.try_next().await {
         let msg = match log {
@@ -613,15 +963,48 @@ async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: 
             _ => continue,
         };
         
+        let len = msg.len() as u64;
+        total_bytes_written += len;
+        current_file_size += len;
+
+        // Protection 1: Hard Limit on Total Throughput
+        if total_bytes_written > LOG_HARD_LIMIT {
+            let _ = publisher.publish(job_id, "\n[CRITICAL] LOG QUOTA EXCEEDED. KILLING CONTAINER.\n").await;
+            error!("[{}] Log Hard Limit ({} MB) exceeded. Killing container...", job_id, LOG_HARD_LIMIT / 1024 / 1024);
+            
+            // Kill the container
+            if let Err(e) = docker.kill_container::<String>(name, None).await {
+                 error!("[{}] Failed to kill container after log overflow: {}", job_id, e);
+            }
+            break; 
+        }
+
+        // Protection 2: Rotation / Truncation
+        if current_file_size > LOG_ROTATION_THRESHOLD {
+            // Seek to beginning and reset length
+            if let Err(e) = file.set_len(0).await {
+                error!("Failed to truncate log file: {}", e);
+            }
+            if let Err(e) = file.seek(SeekFrom::Start(0)).await {
+                error!("Failed to seek log file: {}", e);
+            }
+            current_file_size = 0;
+            let warning = format!("\n--- [LOG TRUNCATED DUE TO SIZE LIMIT > {}MB] ---\n", LOG_ROTATION_THRESHOLD / 1024 / 1024);
+            if let Err(e) = file.write_all(warning.as_bytes()).await {
+                 error!("Failed to write warning to log file: {}", e);
+            }
+            current_file_size += warning.len() as u64;
+        }
+
         // Write to file
         if let Err(e) = file.write_all(&msg).await {
              error!("Failed to write to log file: {}", e);
         }
 
-        // Broadcast to real-time subscribers
+        // Broadcast to real-time subscribers via Redis
         // We convert bytes to string lossily
         let log_str = String::from_utf8_lossy(&msg).to_string();
-        let _ = tx.send(log_str);
+        let _ = publisher.publish(job_id, &log_str).await;
     }
 
     filename
