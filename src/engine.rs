@@ -708,6 +708,8 @@ impl Dispatcher {
                                 retry_count: 0,
                                 enable_network: next_req.enable_network, // Propagate network setting
                                 run_at: next_req.run_at,
+                        stream_id: None,
+                        stream_name: None,
                             };
                             
                             if let Err(e) = queue.enqueue(next_context).await {
@@ -806,6 +808,8 @@ impl Dispatcher {
                                             retry_count: 0,
                                             enable_network: j.enable_network,
                                             run_at: None,
+                                            stream_id: None,
+                                            stream_name: None,
                                         };
                                         
                                         if let Err(e) = queue.enqueue(context).await {

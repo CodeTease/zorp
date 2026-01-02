@@ -265,6 +265,8 @@ async fn handle_dispatch(
             retry_count: 0,
             enable_network: job_req.enable_network,
             run_at: job_req.run_at,
+            stream_id: None,
+            stream_name: None,
         };
 
         // 2. Push to Redis Queue
@@ -634,6 +636,8 @@ async fn handle_workflow_dispatch(
                         retry_count: 0,
                         enable_network: job_req.enable_network,
                         run_at: job_req.run_at,
+                        stream_id: None,
+                        stream_name: None,
                     };
 
                     if let Err(e) = state.queue.enqueue(context).await {

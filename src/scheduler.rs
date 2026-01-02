@@ -64,6 +64,8 @@ impl CronScheduler {
                                 retry_count: 0,
                                 enable_network: req.enable_network,
                                 run_at: req.run_at,
+                        stream_id: None,
+                        stream_name: None,
                             };
                             
                             // Log last run

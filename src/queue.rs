@@ -54,11 +54,12 @@ pub struct RedisQueue {
     queue_name: String, // Default/Normal queue
     queue_high: String,
     queue_low: String,
-    processing_queue_name: String,
     upload_queue_name: String,
     webhook_queue_name: String,
     webhook_retry_zset: String,
     delayed_queue_zset: String,
+    consumer_group: String,
+    consumer_name: String,
 }
 
 impl RedisQueue {
@@ -66,17 +67,47 @@ impl RedisQueue {
         // Support redis+sentinel:// via the url string which redis crate supports automatically
         // but we need to ensure the client is created correctly.
         let client = redis::Client::open(url).expect("Invalid Redis URL");
-        Self {
+        
+        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+        let consumer_name = format!("worker_{}_{}", hostname, uuid::Uuid::new_v4());
+        let consumer_group = "zorp_workers".to_string();
+
+        let queue = Self {
             client,
             queue_name: "zorp_jobs_normal".to_string(),
             queue_high: "zorp_jobs_high".to_string(),
             queue_low: "zorp_jobs_low".to_string(),
-            processing_queue_name: "zorp_jobs:processing".to_string(),
             upload_queue_name: "zorp_uploads".to_string(),
             webhook_queue_name: "zorp:webhooks:pending".to_string(),
             webhook_retry_zset: "zorp:webhooks:retry".to_string(),
             delayed_queue_zset: "zorp:jobs:delayed".to_string(),
+            consumer_group,
+            consumer_name,
+        };
+
+        // Initialize Consumer Groups
+        // We use a synchronous connection to block until groups are created.
+        // This avoids race conditions where workers start before groups exist.
+        if let Ok(mut conn) = queue.client.get_connection() {
+            let streams = [&queue.queue_high, &queue.queue_name, &queue.queue_low];
+            let group = &queue.consumer_group;
+
+            for stream in streams {
+                // XGROUP CREATE stream group $ MKSTREAM
+                let _: redis::RedisResult<()> = redis::cmd("XGROUP")
+                    .arg("CREATE")
+                    .arg(stream)
+                    .arg(group)
+                    .arg("$")
+                    .arg("MKSTREAM")
+                    .query(&mut conn);
+                // Ignore error (likely BUSYGROUP)
+            }
+        } else {
+             eprintln!("Failed to connect to Redis synchronously for Group Init. Workers may fail if groups do not exist.");
         }
+
+        queue
     }
 
     async fn enqueue_upload_dlq(&self, task: UploadTask) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -102,29 +133,40 @@ impl RedisQueue {
         }
     }
 
-    async fn process_payload(&self, payload: Option<String>, conn: &mut redis::aio::MultiplexedConnection) 
+    async fn process_stream_entry(&self, stream_name: &str, id: String, map: std::collections::HashMap<String, redis::Value>, conn: &mut redis::aio::MultiplexedConnection) 
         -> Result<Option<JobContext>, Box<dyn std::error::Error + Send + Sync>> 
     {
-        match payload {
-            Some(payload_str) => {
-                let job: JobContext = serde_json::from_str(&payload_str)
+        // Redis Value to String helper
+        let get_string = |val: &redis::Value| -> Option<String> {
+            match val {
+                redis::Value::BulkString(bytes) => String::from_utf8(bytes.clone()).ok(),
+                _ => None,
+            }
+        };
+
+        if let Some(val) = map.get("payload") {
+            if let Some(payload_str) = get_string(val) {
+                let mut job: JobContext = serde_json::from_str(&payload_str)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 
-                // 1. Store payload for retrieval by monitor (if it expires)
-                let payload_key = format!("zorp:job_payload:{}", job.id);
-                let _: () = conn.set(&payload_key, &payload_str).await
+                // Populate stream info for ACK
+                job.stream_id = Some(id.clone());
+                job.stream_name = Some(stream_name.to_string());
+
+                // Store mapping for Heartbeat (update_heartbeat needs to find Stream ID via Job ID)
+                // zorp:job_stream_ref:{job_id} -> {stream_name}:{stream_id}
+                // Expires in 24 hours (generous upper bound) to avoid leakage
+                let map_key = format!("zorp:job_stream_ref:{}", job.id);
+                let map_val = format!("{}:{}", stream_name, id);
+                let _: () = conn.set_ex(&map_key, map_val, 86400).await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-                // 2. Set initial heartbeat (ZSET)
-                let now = chrono::Utc::now().timestamp();
-                let score = now + 30;
-                let _: () = conn.zadd("zorp:heartbeats", &job.id, score).await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-                Ok(Some(job))
+                return Ok(Some(job));
             }
-            None => Ok(None),
         }
+        
+        warn!("Stream entry {} in {} missing payload field or invalid format.", id, stream_name);
+        Ok(None)
     }
 }
 
@@ -143,6 +185,8 @@ impl JobQueue for RedisQueue {
             if run_at > now {
                 let score = run_at.timestamp();
                 info!("Scheduling job {} for {}", job.id, run_at);
+                // Note: Delayed jobs are stored in ZSET. 
+                // When ready, monitor_delayed_jobs must XADD them.
                 let _: () = conn.zadd(&self.delayed_queue_zset, payload, score).await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                 return Ok(());
@@ -151,8 +195,14 @@ impl JobQueue for RedisQueue {
 
         let target_queue = self.get_queue_for_priority(job.priority.as_deref());
 
-        // LPUSH: Push to the left side of the list
-        let _: () = conn.lpush(target_queue, payload).await
+        // XADD: Add to stream
+        // XADD key * payload value
+        let _: () = redis::cmd("XADD")
+            .arg(target_queue)
+            .arg("*")
+            .arg("payload")
+            .arg(payload)
+            .query_async(&mut conn).await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             
         Ok(())
@@ -177,65 +227,76 @@ impl JobQueue for RedisQueue {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         
-        // Priority Dequeue Logic:
-        // 1. Check HIGH (Non-blocking rpoplpush)
-        // 2. Check NORMAL (Non-blocking rpoplpush)
-        // 3. Check LOW (Blocking brpoplpush with short timeout to circle back to HIGH)
+        // XREADGROUP GROUP group consumer BLOCK 2000 STREAMS high normal low > > >
+        let _streams = &[&self.queue_high, &self.queue_name, &self.queue_low];
+        let _ids = &[">", ">", ">"];
 
-        // Try HIGH
-        // Note: rpoplpush is not available in redis crate async commands directly as a method sometimes?
-        // Checking docs/usage: cmd("RPOPLPUSH").arg(src).arg(dst)
-        let payload: Option<String> = redis::cmd("RPOPLPUSH")
-            .arg(&self.queue_high)
-            .arg(&self.processing_queue_name)
-            .query_async(&mut conn).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        // We use redis::streams::StreamReadReply but it's easier to parse raw response or use the crate helpers.
+        // The return structure of XREADGROUP is complex.
+        // It returns Array of Arrays.
+        // Inner Array: [StreamName, [Entries]]
+        // Entry: [ID, [Field, Value, ...]]
 
-        if payload.is_some() {
-             return self.process_payload(payload, &mut conn).await;
-        }
-
-        // Try NORMAL
-        let payload: Option<String> = redis::cmd("RPOPLPUSH")
-            .arg(&self.queue_name)
-            .arg(&self.processing_queue_name)
-            .query_async(&mut conn).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        if payload.is_some() {
-             return self.process_payload(payload, &mut conn).await;
-        }
-
-        // Try LOW (Blocking with timeout 1s)
-        let payload: Option<String> = conn.brpoplpush(&self.queue_low, &self.processing_queue_name, 1.0).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        type StreamResponse = redis::streams::StreamReadReply;
         
-        self.process_payload(payload, &mut conn).await
+        let result: Option<StreamResponse> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(&self.consumer_group)
+            .arg(&self.consumer_name)
+            .arg("COUNT")
+            .arg(1)
+            .arg("BLOCK")
+            .arg(2000) // 2s block
+            .arg("STREAMS")
+            .arg(&self.queue_high)
+            .arg(&self.queue_name)
+            .arg(&self.queue_low)
+            .arg(">")
+            .arg(">")
+            .arg(">")
+            .query_async(&mut conn).await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if let Some(response) = result {
+            for stream_key in response.keys {
+                let stream_name = stream_key.key;
+                if let Some(entry) = stream_key.ids.first() {
+                     let id = entry.id.clone();
+                     let map = entry.map.clone();
+                     
+                     return self.process_stream_entry(&stream_name, id, map, &mut conn).await;
+                }
+            }
+        }
+        
+        Ok(None)
     }
 
     async fn acknowledge(&self, job: &JobContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
          let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             
-         // We must use the exact string representation to remove it.
-         let payload = serde_json::to_string(job)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            
-         // 1. Remove from processing list
-         let removed: i64 = conn.lrem(&self.processing_queue_name, 1, payload).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            
-         // 2. Remove heartbeat (ZSET)
-         let _: () = conn.zrem("zorp:heartbeats", &job.id).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+         if let (Some(stream_id), Some(stream_name)) = (&job.stream_id, &job.stream_name) {
+             // XACK key group id
+             let ack_count: i64 = redis::cmd("XACK")
+                .arg(stream_name)
+                .arg(&self.consumer_group)
+                .arg(stream_id)
+                .query_async(&mut conn).await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-         // 3. Remove sidecar payload
-         let payload_key = format!("zorp:job_payload:{}", job.id);
-         let _: () = conn.del(&payload_key).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-         if removed == 0 {
-             warn!("Could not acknowledge job {}. It might have been already removed or modified.", job.id);
+             if ack_count == 0 {
+                 warn!("Could not acknowledge job {} from stream. It might have been already ACKed.", job.id);
+             } else {
+                 // info!("Acknowledged job {} from {}", job.id, stream_name);
+                 
+                 // Clean up heartbeat mapping
+                 let map_key = format!("zorp:job_stream_ref:{}", job.id);
+                 let _: () = conn.del(&map_key).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+             }
+         } else {
+             warn!("Job {} has no stream info. Cannot acknowledge in Redis Streams.", job.id);
          }
          
          Ok(())
@@ -245,52 +306,111 @@ impl JobQueue for RedisQueue {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             
-        let mut count = 0;
+        let mut total_restored = 0;
         let dlq_name = format!("{}:dlq", self.queue_name);
+        let min_idle_time = 60_000; // 60 seconds
 
-        loop {
-            // 1. Pop from processing queue (simulating RPOPLPUSH but with inspection)
-            // Note: redis::AsyncCommands::rpop takes 2 args in 0.32 (key, count)
-            let item: Option<String> = conn.rpop(&self.processing_queue_name, None).await
-                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        // Check all streams
+        for stream_name in &[&self.queue_high, &self.queue_name, &self.queue_low] {
+            // XAUTOCLAIM key group consumer min-idle-time start-id count
+            // We iterate until we get 0 messages
+            let mut start_id = "0-0".to_string();
+            
+            loop {
+                let result: redis::streams::StreamAutoClaimReply = redis::cmd("XAUTOCLAIM")
+                    .arg(stream_name)
+                    .arg(&self.consumer_group)
+                    .arg(&self.consumer_name) // Claim to self, then process
+                    .arg(min_idle_time)
+                    .arg(&start_id)
+                    .arg("COUNT")
+                    .arg(10)
+                    .query_async(&mut conn).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-            match item {
-                Some(payload) => {
-                    let mut job: JobContext = match serde_json::from_str(&payload) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            warn!("Poison Pill found! Failed to parse stranded job: {}. Moving to DLQ.", e);
-                            let _: () = conn.lpush(&dlq_name, &payload).await
-                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                            continue;
+                // result.ids contains the stream keys (StreamId)
+                // Note: redis crate StreamAutoClaimReply structure:
+                // pub next_stream_id: String,
+                // pub claimed: Vec<StreamId>,
+                
+                let messages = result.claimed;
+                if messages.is_empty() {
+                    break;
+                }
+                
+                start_id = result.next_stream_id;
+
+                for entry in messages {
+                    let id = entry.id;
+                    let map = entry.map;
+                    
+                    // Helper to extract string from Redis Value
+                    let get_string = |val: &redis::Value| -> Option<String> {
+                        match val {
+                            redis::Value::BulkString(bytes) => String::from_utf8(bytes.clone()).ok(),
+                            _ => None,
                         }
                     };
 
-                    job.retry_count += 1;
-                    
-                    if job.retry_count > 3 {
-                         warn!("Job {} exceeded max retries ({}). Moving to DLQ.", job.id, job.retry_count);
-                         let new_payload = serde_json::to_string(&job).unwrap();
-                         let _: () = conn.lpush(&dlq_name, new_payload).await
-                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                    } else {
-                         let new_payload = serde_json::to_string(&job).unwrap();
-                         // Push back to appropriate queue based on priority
-                         let target_queue = self.get_queue_for_priority(job.priority.as_deref());
-                         let _: () = conn.lpush(target_queue, new_payload).await
-                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                         count += 1;
+                    if let Some(val) = map.get("payload") {
+                        if let Some(payload_str) = get_string(val) {
+                            match serde_json::from_str::<JobContext>(&payload_str) {
+                                Ok(mut job) => {
+                                     job.retry_count += 1;
+                                     let new_payload = serde_json::to_string(&job).unwrap();
+
+                                     // Re-enqueue FIRST (Data Safety)
+                                     if job.retry_count > 3 {
+                                         warn!("Job {} (Stream ID {}) exceeded max retries. Moving to DLQ.", job.id, id);
+                                         let _: () = conn.lpush(&dlq_name, new_payload).await
+                                             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                     } else {
+                                         // Re-enqueue as new message to reset timeout/retry logic cleanly
+                                         let _: () = redis::cmd("XADD")
+                                            .arg(stream_name)
+                                            .arg("*")
+                                            .arg("payload")
+                                            .arg(new_payload)
+                                            .query_async(&mut conn).await
+                                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                         
+                                         total_restored += 1;
+                                     }
+
+                                     // ACK old message ONLY after successful re-queue
+                                     let _: () = redis::cmd("XACK")
+                                        .arg(stream_name)
+                                        .arg(&self.consumer_group)
+                                        .arg(&id)
+                                        .query_async(&mut conn).await
+                                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                },
+                                Err(e) => {
+                                    warn!("Poison Pill found! Failed to parse stranded job (Stream ID {}): {}. Moving to DLQ.", id, e);
+                                    // Move raw payload to DLQ
+                                    let _: () = conn.lpush(&dlq_name, &payload_str).await
+                                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                    
+                                    // ACK to remove from PEL
+                                    let _: () = redis::cmd("XACK")
+                                        .arg(stream_name)
+                                        .arg(&self.consumer_group)
+                                        .arg(&id)
+                                        .query_async(&mut conn).await
+                                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                                }
+                            }
+                        }
                     }
-                },
-                None => break, // List is empty
+                }
             }
         }
         
-        if count > 0 {
-            info!("Restored {} stranded jobs from '{}'", count, self.processing_queue_name);
+        if total_restored > 0 {
+            info!("Restored {} stranded jobs via XAUTOCLAIM", total_restored);
         }
         
-        Ok(count)
+        Ok(total_restored)
     }
 
     async fn monitor_delayed_jobs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -299,29 +419,18 @@ impl JobQueue for RedisQueue {
             
         let now = chrono::Utc::now().timestamp();
         
-        // Atomic Lua Script: ZRANGEBYSCORE -> LPUSH (to processing/target) -> ZREM
-        // Note: We need to parse priority to know WHICH queue to push to.
-        // This makes pure Lua hard because we need to parse JSON.
-        // Compromise: Use ZRANGEBYSCORE to get items, then use a Lua script to "Move if exists in ZSET".
-        // Or simple transaction/lock.
-        // But since we are the only ones removing from ZSET (presumably), we can just be careful.
-        // Ideally, we fetch items, then for each item, we run a Lua script that removes it from ZSET and pushes to List.
-        // Script:
-        // if redis.call("ZREM", KEYS[1], ARGV[1]) == 1 then
-        //     redis.call("LPUSH", KEYS[2], ARGV[1])
-        //     return 1
-        // else
-        //     return 0
-        // end
-        
         // 1. Get ready items (score <= now)
         let items: Vec<String> = conn.zrangebyscore(&self.delayed_queue_zset, "-inf", now).await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             
         let mut count = 0;
+        // Atomic Lua Script: ZREM -> XADD
+        // KEYS[1]: ZSET Key
+        // KEYS[2]: Target Stream Key
+        // ARGV[1]: Payload
         let script = redis::Script::new(r#"
             if redis.call("ZREM", KEYS[1], ARGV[1]) == 1 then
-                redis.call("LPUSH", KEYS[2], ARGV[1])
+                redis.call("XADD", KEYS[2], "*", "payload", ARGV[1])
                 return 1
             else
                 return 0
@@ -359,130 +468,41 @@ impl JobQueue for RedisQueue {
     }
 
     async fn update_heartbeat(&self, job_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        // Use ZSET for efficient range queries (O(log N))
-        let now = chrono::Utc::now().timestamp();
-        // Expiration = now + 30s
-        let score = now + 30;
-        let key = "zorp:heartbeats";
         
-        let _: () = conn.zadd(key, job_id, score).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let mut conn = self.client.get_multiplexed_async_connection().await
+             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+             
+        let map_key = format!("zorp:job_stream_ref:{}", job_id);
+        let ref_val: Option<String> = conn.get(&map_key).await
+             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+             
+        if let Some(val) = ref_val {
+            if let Some((stream_name, stream_id)) = val.split_once(':') {
+                // XCLAIM key group consumer 0 ID JUSTID
+                // Updates idle time to now (resets it)
+                 let _: () = redis::cmd("XCLAIM")
+                    .arg(stream_name)
+                    .arg(&self.consumer_group)
+                    .arg(&self.consumer_name)
+                    .arg(0) // min-idle-time 0 means force claim (update)
+                    .arg(stream_id)
+                    .arg("JUSTID") // Do not return message
+                    .query_async(&mut conn).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+        }
         
         Ok(())
     }
 
     async fn monitor_stranded_jobs(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        info!("❤️  Monitor: Checking for stranded jobs (Heartbeat Check)...");
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        let now = chrono::Utc::now().timestamp();
-        let key = "zorp:heartbeats";
-        let dlq_name = format!("{}:dlq", self.queue_name);
-
-        // Get expired jobs: score < now
-        // ZRANGEBYSCORE key -inf (now - 1)
-        let expired_job_ids: Vec<String> = conn.zrangebyscore(key, "-inf", now).await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        let mut restored_count = 0;
-
-        for job_id in expired_job_ids {
-            // Find the job payload in processing queue? 
-            // The processing queue is a List. Searching a list is O(N).
-            // However, we need the payload to restore it. 
-            // Optimization: Store job payload in a separate HASH or assume we can find it?
-            // If we don't have the payload, we can't restore it easily unless we stored it elsewhere.
-            // But wait, the previous implementation did `lrange` (O(N)) and checked heartbeat for each.
-            // Now we have the ID of the expired job. We need to find its payload in the `processing` list and remove it.
-            // `LREM` removes by value (payload). We don't have the payload, only ID.
-            
-            // To make this O(1) or O(log N), we should have stored the payload in a K/V sidecar 
-            // OR we iterate the processing queue (which is what we wanted to avoid).
-            
-            // Alternative: The `processing` queue isn't strictly needed if we use the ZSET as the "processing" state?
-            // But `processing` list is useful for "at least once" if Redis crashes (persisted list).
-            // A common pattern is `RPOPLPUSH source processing`. 
-            
-            // If we want to avoid O(N) scan of the list, we can keep a side mapping: job_id -> payload.
-            // Let's implement that: When processing, set `zorp:job:{id}` -> payload.
-            // Then we can retrieve it here.
-            
-            // But for now, let's look at `process_payload` in `RedisQueue` where we set the initial heartbeat.
-            // We should also set the sidecar key there?
-            // Existing `process_payload` does: `conn.set_ex(key, "1", 30)`.
-            // We can change that to `conn.set(format!("zorp:job_payload:{}", job.id), payload_str)`.
-            
-            // Let's try to find the payload using the sidecar key approach.
-            // Assuming we will modify `process_payload` next.
-            
-            let payload_key = format!("zorp:job_payload:{}", job_id);
-            let payload: Option<String> = conn.get(&payload_key).await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            
-            if let Some(payload_str) = payload {
-                // Parse to check/update retry count
-                let mut job: JobContext = match serde_json::from_str(&payload_str) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        warn!("Failed to parse expired job {}: {}", job_id, e);
-                         // Clean up bad state
-                        let _: () = conn.zrem(key, &job_id).await.unwrap_or(());
-                        continue;
-                    }
-                };
-                
-                // Remove from processing queue (LREM)
-                // We use the payload string we just fetched.
-                let removed: i64 = conn.lrem(&self.processing_queue_name, 1, &payload_str).await
-                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                
-                // Clean up heartbeat & payload key
-                let _: () = conn.zrem(key, &job_id).await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let _: () = conn.del(&payload_key).await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-                if removed == 0 {
-                    // Job was NOT in processing queue. It finished successfully but heartbeat lingered (race condition).
-                    // We already cleaned up the heartbeat above. Do NOTHING else.
-                    info!("Job {} finished successfully (not in processing), cleaning up stale heartbeat.", job.id);
-                    continue;
-                }
-
-                info!("Heartbeat expired for job {}. Restoring...", job_id);
-
-                // POISON PILL LOGIC
-                job.retry_count += 1;
-                
-                let new_payload = serde_json::to_string(&job).unwrap();
-                
-                if job.retry_count > 3 {
-                     warn!("Job {} exceeded max retries ({}). Moving to DLQ.", job.id, job.retry_count);
-                     let _: () = conn.lpush(&dlq_name, new_payload).await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                } else {
-                     let target_queue = self.get_queue_for_priority(job.priority.as_deref());
-                     let _: () = conn.lpush(target_queue, new_payload).await
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                     restored_count += 1;
-                }
-            } else {
-                 // Payload missing? Maybe it finished and heartbeat is stale?
-                 // Just remove from ZSET.
-                 let _: () = conn.zrem(key, &job_id).await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            }
-        }
-        
-        if restored_count > 0 {
-            info!("Monitor: Restored {} stranded jobs.", restored_count);
-        }
-
-        Ok(restored_count)
+        // This method is now redundant because `restore_stranded` does the work.
+        // However, the trait defines both. 
+        // Usually `monitor_stranded_jobs` was the "Heartbeat Check".
+        // `restore_stranded` was the "Queue Check".
+        // Now they are unified in `XAUTOCLAIM`.
+        // I'll alias this to `restore_stranded`.
+        self.restore_stranded().await
     }
 
     async fn ping(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -638,15 +658,6 @@ impl JobQueue for RedisQueue {
     }
     
     async fn get_client_connection_if_possible(&self) -> redis::aio::MultiplexedConnection {
-        // This is a hack because the API change I made referenced this method which doesn't exist.
-        // But since I'm overwriting the API file too, I don't actually need this method if I fix the API call.
-        // However, I added it to the TRAIT definition in the block above (by mistake?)
-        // Let's check the Search block again.
-        // I added `async fn get_client_connection_if_possible` to the trait in the previous replacement.
-        // I should probably REMOVE it from the trait and just use `delete_idempotency_key`.
-        // But the `REPLACE` block put it there.
-        // I will implement it to satisfy the trait I just defined, but panicking is bad if called.
-        // Actually, I can just return a connection!
         self.client.get_multiplexed_async_connection().await.expect("Redis connection failed")
     }
 

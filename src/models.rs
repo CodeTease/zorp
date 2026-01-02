@@ -86,6 +86,10 @@ pub struct JobContext {
     #[serde(default)]
     pub enable_network: bool,
     pub run_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub stream_id: Option<String>,
+    #[serde(skip)]
+    pub stream_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

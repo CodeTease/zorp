@@ -186,6 +186,8 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
                     retry_count: 0,
                     enable_network: job.enable_network.unwrap_or(false),
                     run_at: None,
+                    stream_id: None,
+                    stream_name: None,
                 };
 
                 info!("♻️  Re-enqueuing stuck job: {}", context.id);
