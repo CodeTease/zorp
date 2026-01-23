@@ -1,6 +1,6 @@
+use hex;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use hex;
 
 pub fn sign_payload(secret: &str, payload: &str) -> Option<String> {
     type HmacSha256 = Hmac<Sha256>;

@@ -1,9 +1,9 @@
+use crate::queue::JobQueue;
+use crate::security;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast::Receiver;
-use tracing::{info, warn, error};
-use crate::queue::JobQueue;
-use serde::{Deserialize, Serialize};
-use crate::security;
+use tracing::{error, info, warn};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WebhookPayload {
@@ -27,7 +27,7 @@ pub fn spawn(
     let queue_monitor = queue.clone();
     let client = http_client.clone();
     let key = secret_key.clone();
-    
+
     // 1. Processor Task
     tokio::spawn(async move {
         info!("🔔 Webhook Worker started.");
@@ -60,7 +60,7 @@ pub fn spawn(
                                 "duration_seconds": payload.duration_seconds,
                                 "logs": payload.logs
                             });
-                            
+
                             let mut headers = reqwest::header::HeaderMap::new();
                             if let Ok(p_str) = serde_json::to_string(&user_payload) {
                                 if let Some(sig) = security::sign_payload(&key, &p_str) {
@@ -75,7 +75,7 @@ pub fn spawn(
                                 .json(&user_payload)
                                 .send()
                                 .await;
-                            
+
                             match resp {
                                 Ok(res) => {
                                     if !res.status().is_success() {
@@ -118,16 +118,22 @@ pub fn spawn(
 
 async fn handle_retry(queue: &Arc<dyn JobQueue>, mut payload: WebhookPayload) {
     if payload.attempt >= 5 {
-        error!("[{}] Webhook failed after 5 attempts. Giving up.", payload.job_id);
+        error!(
+            "[{}] Webhook failed after 5 attempts. Giving up.",
+            payload.job_id
+        );
         return;
     }
 
     payload.attempt += 1;
     // Exponential backoff: 2^attempt * 30 seconds
     let delay = 30 * 2i64.pow(payload.attempt - 1); // 30s, 60s, 120s...
-    
+
     if let Ok(json) = serde_json::to_string(&payload) {
-        info!("[{}] Scheduling retry #{} in {}s", payload.job_id, payload.attempt, delay);
+        info!(
+            "[{}] Scheduling retry #{} in {}s",
+            payload.job_id, payload.attempt, delay
+        );
         if let Err(e) = queue.enqueue_webhook_retry(json, delay).await {
             error!("Failed to enqueue webhook retry: {}", e);
         }

@@ -1,8 +1,8 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use chrono::{DateTime, Utc};
 use validator::Validate;
 
 // --- DATA STRUCTURES ---
@@ -27,7 +27,11 @@ pub struct ServiceRequest {
 pub struct JobRequest {
     #[validate(length(min = 1, message = "Image name cannot be empty"))]
     pub image: String,
-    #[validate(length(min = 1, max = 100, message = "Commands list must be between 1 and 100 items"))]
+    #[validate(length(
+        min = 1,
+        max = 100,
+        message = "Commands list must be between 1 and 100 items"
+    ))]
     pub commands: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub limits: Option<JobLimits>,
@@ -61,7 +65,7 @@ pub struct JobStatus {
     pub user_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)] 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobContext {
     pub id: String,
     pub image: String,
@@ -90,6 +94,8 @@ pub struct JobContext {
     pub stream_id: Option<String>,
     #[serde(skip)]
     pub stream_name: Option<String>,
+    #[serde(default)]
+    pub trace_context: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

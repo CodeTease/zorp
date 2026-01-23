@@ -18,16 +18,19 @@ jobs:
 "#;
 
         let graph = parse_workflow(yaml).unwrap();
-        
+
         // build and test
         assert_eq!(graph.jobs.len(), 2);
-        
+
         let build_job = graph.jobs.get("build").expect("build job missing");
         assert_eq!(build_job.image, "rust:latest");
-        
+
         // build should have 'test' as dependency in the dependency map
         // Dependencies map is Parent -> [Children]
-        let children = graph.dependencies.get("build").expect("build should have dependencies");
+        let children = graph
+            .dependencies
+            .get("build")
+            .expect("build should have dependencies");
         assert_eq!(children.len(), 1);
         assert_eq!(children[0], "test");
 
@@ -55,18 +58,22 @@ jobs:
 "#;
 
         let graph = parse_workflow(yaml).unwrap();
-        
+
         // 1 build job + 4 test jobs = 5 total
         assert_eq!(graph.jobs.len(), 5);
-        
+
         // Check dependencies: Build -> 4 test jobs
-        let children = graph.dependencies.get("build").expect("build should have children");
+        let children = graph
+            .dependencies
+            .get("build")
+            .expect("build should have children");
         assert_eq!(children.len(), 4);
 
-        let images: Vec<String> = children.iter()
+        let images: Vec<String> = children
+            .iter()
             .map(|key| graph.jobs.get(key).unwrap().image.clone())
             .collect();
-            
+
         assert!(images.contains(&"test:1.0-linux".to_string()));
         assert!(images.contains(&"test:1.0-windows".to_string()));
         assert!(images.contains(&"test:2.0-linux".to_string()));
@@ -76,7 +83,10 @@ jobs:
         // Keys are likely "test-1.0-linux" etc based on my implementation sorting
         // But exact key string depends on suffix generation
         // Let's find one
-        let key = children.iter().find(|k| graph.jobs.get(*k).unwrap().image == "test:1.0-linux").unwrap();
+        let key = children
+            .iter()
+            .find(|k| graph.jobs.get(*k).unwrap().image == "test:1.0-linux")
+            .unwrap();
         let job = graph.jobs.get(key).unwrap();
         let env = job.env.as_ref().unwrap();
         assert_eq!(env.get("MATRIX_OS"), Some(&"linux".to_string()));
@@ -118,7 +128,7 @@ jobs:
         match result {
             Err(crate::workflow::WorkflowError::CycleDetected(node)) => {
                 assert!(node == "job1" || node == "job2");
-            },
+            }
             _ => panic!("Expected CycleDetected error"),
         }
     }

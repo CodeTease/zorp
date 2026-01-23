@@ -27,10 +27,10 @@ pub fn expand_job_request(request: &JobRequest) -> Vec<JobRequest> {
             let mut new_req = request.clone();
             // Substitute variables in image, commands, and env
             substitute_variables(&mut new_req, &vars);
-            
+
             // Clear the matrix in the expanded request to avoid infinite recursion if re-processed
             new_req.matrix = None;
-            
+
             requests.push(new_req);
         }
         requests
@@ -41,16 +41,18 @@ pub fn expand_job_request(request: &JobRequest) -> Vec<JobRequest> {
 
 fn substitute_variables(req: &mut JobRequest, vars: &HashMap<String, String>) {
     req.image = substitute_string(&req.image, vars);
-    
-    req.commands = req.commands.iter()
+
+    req.commands = req
+        .commands
+        .iter()
         .map(|cmd| substitute_string(cmd, vars))
         .collect();
-    
+
     if let Some(env) = &mut req.env {
         for val in env.values_mut() {
             *val = substitute_string(val, vars);
         }
-		
+
         for (k, v) in vars {
             env.insert(k.clone(), v.clone());
         }
@@ -104,7 +106,10 @@ mod tests {
     fn test_expand_matrix() {
         let mut matrix = HashMap::new();
         matrix.insert("node".to_string(), vec!["18".to_string(), "20".to_string()]);
-        matrix.insert("os".to_string(), vec!["alpine".to_string(), "debian".to_string()]);
+        matrix.insert(
+            "os".to_string(),
+            vec!["alpine".to_string(), "debian".to_string()],
+        );
 
         let req = JobRequest {
             image: "node:${node}-${os}".to_string(),
@@ -130,9 +135,11 @@ mod tests {
         assert_eq!(expanded.len(), 4); // 2 * 2 = 4
 
         // Verify substitution
-        let has_node18_alpine = expanded.iter().any(|r| r.image == "node:18-alpine" && r.commands[0] == "echo running on alpine");
+        let has_node18_alpine = expanded
+            .iter()
+            .any(|r| r.image == "node:18-alpine" && r.commands[0] == "echo running on alpine");
         assert!(has_node18_alpine);
-        
+
         // Verify env injection
         let r = expanded.first().unwrap();
         assert!(r.env.is_some());

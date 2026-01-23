@@ -1,12 +1,12 @@
-use std::path::Path;
-use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, error};
 use aws_sdk_s3::Client;
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
+use std::path::Path;
 use tar::Archive;
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{error, info, warn};
 
 pub async fn restore_cache(
     s3_client: &Client,
@@ -27,27 +27,38 @@ pub async fn restore_cache(
         .map_err(|e| format!("Failed to download cache: {}", e))?;
 
     let temp_tar_path = format!("/tmp/cache-{}.tar.gz", cache_key);
-    let mut temp_file = File::create(&temp_tar_path).await
+    let mut temp_file = File::create(&temp_tar_path)
+        .await
         .map_err(|e| format!("Failed to create temp file: {}", e))?;
 
     let mut stream = resp.body.into_async_read();
     let mut buffer = [0u8; 8192];
 
     loop {
-        let bytes_read = stream.read(&mut buffer).await
+        let bytes_read = stream
+            .read(&mut buffer)
+            .await
             .map_err(|e| format!("Error reading S3 stream: {}", e))?;
-        if bytes_read == 0 { break; }
-        temp_file.write_all(&buffer[..bytes_read]).await
+        if bytes_read == 0 {
+            break;
+        }
+        temp_file
+            .write_all(&buffer[..bytes_read])
+            .await
             .map_err(|e| format!("Error writing to temp file: {}", e))?;
     }
-    
+
     // Ensure data is flushed
-    temp_file.flush().await.map_err(|e| format!("Error flushing temp file: {}", e))?;
+    temp_file
+        .flush()
+        .await
+        .map_err(|e| format!("Error flushing temp file: {}", e))?;
 
     // 2. Extract
     info!("Extracting cache to {:?}", target_path);
     if !target_path.exists() {
-        fs::create_dir_all(target_path).await
+        fs::create_dir_all(target_path)
+            .await
             .map_err(|e| format!("Failed to create cache dir: {}", e))?;
     }
 
@@ -61,10 +72,12 @@ pub async fn restore_cache(
             .map_err(|e| format!("Failed to open tar.gz: {}", e))?;
         let tar = GzDecoder::new(tar_gz);
         let mut archive = Archive::new(tar);
-        archive.unpack(target_path_clone)
+        archive
+            .unpack(target_path_clone)
             .map_err(|e| format!("Failed to unpack archive: {}", e))?;
         Ok::<(), String>(())
-    }).await;
+    })
+    .await;
 
     // Cleanup temp file
     let _ = fs::remove_file(&temp_tar_path).await;
@@ -87,7 +100,7 @@ pub async fn save_cache(
 
     let s3_key = format!("cache/{}.tar.gz", cache_key);
     let temp_tar_path = format!("/tmp/cache-{}-save.tar.gz", cache_key);
-    
+
     info!("Compressing cache from {:?}", source_path);
 
     let temp_tar_path_clone = temp_tar_path.clone();
@@ -101,30 +114,34 @@ pub async fn save_cache(
         let mut tar = tar::Builder::new(enc);
         tar.append_dir_all(".", source_path_clone)
             .map_err(|e| format!("Failed to append dir to tar: {}", e))?;
-        tar.finish().map_err(|e| format!("Failed to finish tar: {}", e))?;
+        tar.finish()
+            .map_err(|e| format!("Failed to finish tar: {}", e))?;
         Ok::<(), String>(())
-    }).await;
+    })
+    .await;
 
     match compress_result {
-        Ok(Ok(_)) => {},
+        Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),
         Err(e) => return Err(format!("Compression task failed: {}", e)),
     }
 
     // Upload
     info!("Uploading cache to s3://{}/{}", bucket, s3_key);
-    let body = aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(&temp_tar_path)).await;
-    
+    let body =
+        aws_sdk_s3::primitives::ByteStream::from_path(std::path::Path::new(&temp_tar_path)).await;
+
     match body {
         Ok(b) => {
-            let _ = s3_client.put_object()
+            let _ = s3_client
+                .put_object()
                 .bucket(bucket)
                 .key(&s3_key)
                 .body(b)
                 .send()
                 .await
                 .map_err(|e| format!("Failed to upload cache: {}", e))?;
-        },
+        }
         Err(e) => return Err(format!("Failed to read compressed cache file: {}", e)),
     }
 

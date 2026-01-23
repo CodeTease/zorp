@@ -1,25 +1,24 @@
+use crate::db::DbPool;
+use crate::models::UploadTask;
+use crate::queue::{JobQueue, RedisQueue};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{info, warn, error};
-use crate::queue::{RedisQueue, JobQueue};
-use crate::models::UploadTask;
-use crate::db::DbPool;
+use tracing::{error, info, warn};
 
 // We need to pass the S3 client and other deps.
 // To avoid complex structs, we can just pass them to the spawn function.
 
 pub fn spawn(
-    queue: Arc<RedisQueue>, 
-    s3_client: aws_sdk_s3::Client, 
-    s3_bucket: String, 
+    queue: Arc<RedisQueue>,
+    s3_client: aws_sdk_s3::Client,
+    s3_bucket: String,
     _db_pool: DbPool, // Might be needed for status updates, currently unused in the block but passed in main
-    mut shutdown_rx: broadcast::Receiver<()>
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
-    
     tokio::spawn(async move {
         info!("☁️  Upload Worker thread started.");
         loop {
-             tokio::select! {
+            tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!("☁️  Upload Worker stopping...");
                     break;
@@ -45,13 +44,16 @@ pub fn spawn(
 }
 
 async fn process_upload(
-    task: &UploadTask, 
-    s3_client: &aws_sdk_s3::Client, 
-    s3_bucket: &str, 
-    queue: &Arc<RedisQueue>
+    task: &UploadTask,
+    s3_client: &aws_sdk_s3::Client,
+    s3_bucket: &str,
+    queue: &Arc<RedisQueue>,
 ) {
-    info!("☁️  Processing upload task for job {}: {} ({})", task.job_id, task.s3_key, task.upload_type);
-    
+    info!(
+        "☁️  Processing upload task for job {}: {} ({})",
+        task.job_id, task.s3_key, task.upload_type
+    );
+
     let path = std::path::Path::new(&task.file_path);
     if path.exists() {
         let body = match aws_sdk_s3::primitives::ByteStream::from_path(path).await {
@@ -62,42 +64,47 @@ async fn process_upload(
             }
         };
 
-        match s3_client.put_object()
+        match s3_client
+            .put_object()
             .bucket(s3_bucket)
             .key(&task.s3_key)
             .body(body)
             .send()
-            .await 
+            .await
         {
             Ok(_) => {
                 let s3_url = format!("s3://{}/{}", s3_bucket, task.s3_key);
                 info!("✅ Upload successful: {}", s3_url);
-                
+
                 // Clean up file
                 let _ = tokio::fs::remove_file(path).await;
-            },
+            }
             Err(e) => {
-                error!("❌ S3 Upload Failed: {}. (Attempt: {})", e, task.retry_count + 1);
+                error!(
+                    "❌ S3 Upload Failed: {}. (Attempt: {})",
+                    e,
+                    task.retry_count + 1
+                );
                 let mut retry_task = task.clone();
                 retry_task.retry_count += 1;
-                
+
                 if retry_task.retry_count > 5 {
-                     error!("❌ Upload exceeded max retries. Moving to DLQ.");
-                     if let Err(dlq_err) = queue.enqueue_upload_dlq(retry_task).await {
-                         error!("Failed to move upload task to DLQ: {}", dlq_err);
-                     }
+                    error!("❌ Upload exceeded max retries. Moving to DLQ.");
+                    if let Err(dlq_err) = queue.enqueue_upload_dlq(retry_task).await {
+                        error!("Failed to move upload task to DLQ: {}", dlq_err);
+                    }
                 } else {
-                     // Non-blocking Exponential Backoff via Tokio Task
-                     let delay = 2u64.pow(retry_task.retry_count);
-                     warn!("Retrying upload in {}s...", delay);
-                     
-                     let q_clone = queue.clone();
-                     tokio::spawn(async move {
-                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                         if let Err(re_err) = q_clone.enqueue_upload(retry_task).await {
-                              error!("Failed to re-enqueue upload task: {}", re_err);
-                         }
-                     });
+                    // Non-blocking Exponential Backoff via Tokio Task
+                    let delay = 2u64.pow(retry_task.retry_count);
+                    warn!("Retrying upload in {}s...", delay);
+
+                    let q_clone = queue.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        if let Err(re_err) = q_clone.enqueue_upload(retry_task).await {
+                            error!("Failed to re-enqueue upload task: {}", re_err);
+                        }
+                    });
                 }
             }
         }

@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use tokio_cron_scheduler::{JobScheduler, Job};
-use tracing::{info, warn, error};
-use crate::queue::JobQueue;
 use crate::db::DbPool;
 use crate::models::JobContext;
-use uuid::Uuid;
+use crate::queue::JobQueue;
+use std::sync::Arc;
 use tokio::sync::broadcast::Receiver;
+use tokio_cron_scheduler::{Job, JobScheduler};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 pub struct CronScheduler {
     scheduler: JobScheduler,
@@ -14,23 +14,32 @@ pub struct CronScheduler {
 }
 
 impl CronScheduler {
-    pub async fn new(db: DbPool, queue: Arc<dyn JobQueue>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(
+        db: DbPool,
+        queue: Arc<dyn JobQueue>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let scheduler = JobScheduler::new().await?;
-        Ok(Self { scheduler, db, queue })
+        Ok(Self {
+            scheduler,
+            db,
+            queue,
+        })
     }
 
     pub async fn load_jobs(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("⏳ Loading Cron Jobs from DB...");
-        
-        let rows = sqlx::query_as::<_, (String, String, String)>("SELECT id, schedule, payload FROM cron_jobs")
-            .fetch_all(&self.db)
-            .await?;
+
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT id, schedule, payload FROM cron_jobs",
+        )
+        .fetch_all(&self.db)
+        .await?;
 
         for (id, schedule, payload_str) in rows {
             let queue = self.queue.clone();
             let db = self.db.clone();
             let job_id = id.clone();
-            
+
             info!("   - Scheduled Job {}: {}", id, schedule);
 
             let job_closure = move |_uuid, _l| {
@@ -41,7 +50,7 @@ impl CronScheduler {
 
                 Box::pin(async move {
                     info!("⏰ Triggering Cron Job: {}", job_id);
-                    
+
                     match serde_json::from_str::<crate::models::JobRequest>(&payload_str) {
                         Ok(req) => {
                             let new_id = Uuid::new_v4().to_string();
@@ -64,10 +73,11 @@ impl CronScheduler {
                                 retry_count: 0,
                                 enable_network: req.enable_network,
                                 run_at: req.run_at,
-                        stream_id: None,
-                        stream_name: None,
+                                stream_id: None,
+                                stream_name: None,
+                                trace_context: std::collections::HashMap::new(),
                             };
-                            
+
                             // Log last run
                             let _ = sqlx::query("UPDATE cron_jobs SET last_run_at = CURRENT_TIMESTAMP WHERE id = $1")
                                 .bind(&job_id)
@@ -76,11 +86,14 @@ impl CronScheduler {
                             // Insert into jobs table (required for foreign key constraints usually, or just consistency)
                             // We need to insert into 'jobs' before enqueueing so engine can update it.
                             // However, engine does UPDATE... so we need INSERT first.
-                            
+
                             let cmds_json = match serde_json::to_string(&context.commands) {
                                 Ok(j) => j,
                                 Err(e) => {
-                                    error!("Failed to serialize commands for job {}: {}", job_id, e);
+                                    error!(
+                                        "Failed to serialize commands for job {}: {}",
+                                        job_id, e
+                                    );
                                     return;
                                 }
                             };
@@ -101,12 +114,13 @@ impl CronScheduler {
                             } else {
                                 info!("✅ Enqueued cron job instance: {}", new_id);
                             }
-                        },
+                        }
                         Err(e) => {
                             error!("Failed to parse cron job payload: {}", e);
                         }
                     }
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             };
 
             let job = Job::new_async(schedule.as_str(), job_closure)?;
@@ -134,7 +148,7 @@ pub async fn spawn(db: DbPool, queue: Arc<dyn JobQueue>, mut shutdown: Receiver<
     // Wait for shutdown signal
     let _ = shutdown.recv().await;
     info!("⏳ Stopping Cron Scheduler...");
-    // There is no clean 'stop' method on the scheduler instance that we hold easily without Arc/Mutex, 
+    // There is no clean 'stop' method on the scheduler instance that we hold easily without Arc/Mutex,
     // but dropping it or process exit handles it.
     // However, since we own it here, it will be dropped when this task ends.
 }

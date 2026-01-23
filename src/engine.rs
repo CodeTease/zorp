@@ -1,32 +1,37 @@
+use crate::cache;
+use crate::db::DbPool;
+use crate::metrics;
+use crate::models::{JobContext, JobRegistry, ServiceRequest, UploadTask};
+use crate::queue::JobQueue;
+use crate::security;
+use crate::streaming::RedisLogPublisher;
+use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
-    StartContainerOptions, WaitContainerOptions, DownloadFromContainerOptions, ListContainersOptions,
-    StopContainerOptions, NetworkingConfig,
+    Config, CreateContainerOptions, DownloadFromContainerOptions, ListContainersOptions, LogOutput,
+    LogsOptions, NetworkingConfig, RemoveContainerOptions, StartContainerOptions,
+    StopContainerOptions, WaitContainerOptions,
 };
 use bollard::image::CreateImageOptions;
-use bollard::volume::{CreateVolumeOptions, ListVolumesOptions}; 
-use bollard::models::{HostConfig, EndpointSettings};
-use bollard::Docker;
-use futures_util::TryStreamExt; 
-use futures_util::StreamExt;    
+use bollard::models::{EndpointSettings, HostConfig};
+use bollard::network::CreateNetworkOptions;
+use bollard::volume::{CreateVolumeOptions, ListVolumesOptions};
+use futures_util::StreamExt;
+use futures_util::TryStreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, AsyncSeekExt, SeekFrom}; 
-use tracing::{info, warn, error};
-use crate::models::{JobContext, JobRegistry, UploadTask, ServiceRequest};
-use crate::db::DbPool;
-use crate::queue::JobQueue;
-use crate::metrics;
-use crate::streaming::RedisLogPublisher;
-use bollard::network::CreateNetworkOptions;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::security;
-use crate::cache;
-use std::collections::HashMap;
 
 use aws_sdk_s3;
+
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const ZORP_NETWORK_NAME: &str = "zorp-net";
 
@@ -35,13 +40,15 @@ fn check_image_policy(image: &str) -> Result<(), String> {
     if allowed_images.is_empty() {
         return Ok(());
     }
-    
+
     use regex::Regex;
-    
+
     for pattern in allowed_images.split(',') {
         let pattern = pattern.trim();
-        if pattern.is_empty() { continue; }
-        
+        if pattern.is_empty() {
+            continue;
+        }
+
         if pattern.starts_with("regex:") {
             let re_str = pattern.trim_start_matches("regex:");
             if let Ok(re) = Regex::new(re_str) {
@@ -49,7 +56,7 @@ fn check_image_policy(image: &str) -> Result<(), String> {
                     return Ok(());
                 }
             } else {
-                 warn!("Invalid regex policy: {}", re_str);
+                warn!("Invalid regex policy: {}", re_str);
             }
         } else {
             if pattern.ends_with('*') {
@@ -63,14 +70,17 @@ fn check_image_policy(image: &str) -> Result<(), String> {
         }
     }
 
-    Err(format!("Image '{}' is not allowed by ZORP_ALLOWED_IMAGES policy.", image))
+    Err(format!(
+        "Image '{}' is not allowed by ZORP_ALLOWED_IMAGES policy.",
+        image
+    ))
 }
 
 pub async fn cancel_job(
     docker: &Docker,
     registry: &JobRegistry,
     job_id: &str,
-    db: &DbPool
+    db: &DbPool,
 ) -> Result<bool, String> {
     let container_name = {
         let mut reg = registry.write().await;
@@ -78,22 +88,30 @@ pub async fn cancel_job(
     };
 
     if let Some(container_id) = container_name {
-        info!("Cancellation requested for job {}. Stopping container {} (Grace period: 10s)...", job_id, container_id);
+        info!(
+            "Cancellation requested for job {}. Stopping container {} (Grace period: 10s)...",
+            job_id, container_id
+        );
 
-        let stop_opts = StopContainerOptions { t: 10 }; 
+        let stop_opts = StopContainerOptions { t: 10 };
         match docker.stop_container(&container_id, Some(stop_opts)).await {
             Ok(_) => {
                 info!("Container {} stopped successfully.", container_id);
             }
             Err(e) => {
-                warn!("Failed to gracefully stop container {}: {}. Attempting forced kill...", container_id, e);
+                warn!(
+                    "Failed to gracefully stop container {}: {}. Attempting forced kill...",
+                    container_id, e
+                );
                 if let Err(k_e) = docker.kill_container::<String>(&container_id, None).await {
-                     warn!("Failed to kill container {}: {}", container_id, k_e);
+                    warn!("Failed to kill container {}: {}", container_id, k_e);
                 }
             }
         }
 
-        let mut q_builder = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'CANCELLED' WHERE id = ");
+        let mut q_builder = sqlx::query_builder::QueryBuilder::new(
+            "UPDATE jobs SET status = 'CANCELLED' WHERE id = ",
+        );
         q_builder.push_bind(job_id);
 
         if let Err(e) = q_builder.build().execute(db).await {
@@ -103,7 +121,10 @@ pub async fn cancel_job(
         return Ok(true);
     }
 
-    warn!("Cancellation requested for job {}, but it was not found in active registry.", job_id);
+    warn!(
+        "Cancellation requested for job {}, but it was not found in active registry.",
+        job_id
+    );
     Ok(false)
 }
 
@@ -123,9 +144,9 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     pub fn new(
-        docker: Docker, 
-        db: DbPool, 
-        http_client: reqwest::Client, 
+        docker: Docker,
+        db: DbPool,
+        http_client: reqwest::Client,
         max_concurrent: usize,
         job_registry: JobRegistry,
         s3_client: aws_sdk_s3::Client,
@@ -148,16 +169,23 @@ impl Dispatcher {
 
     pub async fn reconcile_state(&self) -> Result<(), String> {
         info!("Starting reconciliation...");
-        let containers = self.docker.list_containers(Some(ListContainersOptions {
-            filters: HashMap::from([("label".to_string(), vec!["managed_by=zorp".to_string()])]),
-            ..Default::default()
-        })).await.map_err(|e| format!("Failed to list containers: {}", e))?;
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                filters: HashMap::from([(
+                    "label".to_string(),
+                    vec!["managed_by=zorp".to_string()],
+                )]),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|e| format!("Failed to list containers: {}", e))?;
 
         for c in containers {
             if let Some(names) = c.names {
                 // Docker names start with slash usually, e.g. /zorp-uuid
                 let name = names.first().ok_or("No name")?.trim_start_matches('/');
-                
+
                 // Get Job ID from Label
                 let job_id = if let Some(labels) = c.labels.as_ref() {
                     labels.get("job_id").cloned()
@@ -182,11 +210,17 @@ impl Dispatcher {
                     let job_id_clone = id.clone();
                     let redis_client = self.queue.get_client();
                     let log_publisher = RedisLogPublisher::new(redis_client);
-                    
+
                     // Spawn a log streamer just in case it's still running
                     tokio::spawn(async move {
                         // We assume it's running. If it exits, this returns.
-                         stream_logs_to_file_and_broadcast(&docker, &container_name, &job_id_clone, &log_publisher).await;
+                        stream_logs_to_file_and_broadcast(
+                            &docker,
+                            &container_name,
+                            &job_id_clone,
+                            &log_publisher,
+                        )
+                        .await;
                     });
                 }
             }
@@ -196,6 +230,15 @@ impl Dispatcher {
 
     pub async fn dispatch(&self, job: JobContext) {
         let permit = self.limiter.clone().acquire_owned().await.unwrap();
+
+        // Extract Tracing Context
+        let parent_context = {
+            let propagator = TraceContextPropagator::new();
+            propagator.extract(&job.trace_context)
+        };
+        let span = tracing::info_span!("job_execution", job_id = %job.id);
+        span.set_parent(parent_context);
+
         let docker = self.docker.clone();
         let db = self.db.clone();
         let http_client = self.http_client.clone();
@@ -204,7 +247,7 @@ impl Dispatcher {
         let s3_bucket = self.s3_bucket.clone();
         let secret_key = self.secret_key.clone();
         let queue = self.queue.clone();
-        
+
         tokio::spawn(async move {
             let _permit = permit; 
             metrics::inc_running();
@@ -710,6 +753,7 @@ impl Dispatcher {
                                 run_at: next_req.run_at,
                         stream_id: None,
                         stream_name: None,
+                        trace_context: job.trace_context.clone(),
                             };
                             
                             if let Err(e) = queue.enqueue(next_context).await {
@@ -810,6 +854,7 @@ impl Dispatcher {
                                             run_at: None,
                                             stream_id: None,
                                             stream_name: None,
+                                            trace_context: job.trace_context.clone(),
                                         };
                                         
                                         if let Err(e) = queue.enqueue(context).await {
@@ -918,21 +963,37 @@ impl Dispatcher {
                     }
                 }
             }
-        });
+        }.instrument(span));
     }
 }
 
 async fn ensure_image(docker: &Docker, image: &str) -> Result<(), bollard::errors::Error> {
-    let image = if !image.contains(':') { format!("{}:latest", image) } else { image.to_string() };
-    if docker.inspect_image(&image).await.is_ok() { 
-        return Ok(()); 
+    let image = if !image.contains(':') {
+        format!("{}:latest", image)
+    } else {
+        image.to_string()
+    };
+    if docker.inspect_image(&image).await.is_ok() {
+        return Ok(());
     }
-    let mut stream = docker.create_image(Some(CreateImageOptions { from_image: image.clone(), ..Default::default() }), None, None);
+    let mut stream = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: image.clone(),
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
     while let Some(_) = stream.try_next().await? {}
     Ok(())
 }
 
-async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: &str, publisher: &RedisLogPublisher) -> String {
+async fn stream_logs_to_file_and_broadcast(
+    docker: &Docker,
+    name: &str,
+    job_id: &str,
+    publisher: &RedisLogPublisher,
+) -> String {
     let filename = format!("/tmp/zorp-{}.log", job_id);
     let path = std::path::Path::new(&filename);
 
@@ -945,13 +1006,17 @@ async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: 
     };
 
     let options = Some(LogsOptions::<String> {
-        stdout: true, stderr: true, follow: true, tail: "all".to_string(), ..Default::default()
+        stdout: true,
+        stderr: true,
+        follow: true,
+        tail: "all".to_string(),
+        ..Default::default()
     });
     let mut stream = docker.logs(name, options);
-    
+
     let mut total_bytes_written: u64 = 0;
     let mut current_file_size: u64 = 0;
-    
+
     // Limits
     const LOG_ROTATION_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
     const LOG_HARD_LIMIT: u64 = 50 * 1024 * 1024; // 50MB (Total throughput)
@@ -962,21 +1027,33 @@ async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: 
             LogOutput::StdErr { message } => message,
             _ => continue,
         };
-        
+
         let len = msg.len() as u64;
         total_bytes_written += len;
         current_file_size += len;
 
         // Protection 1: Hard Limit on Total Throughput
         if total_bytes_written > LOG_HARD_LIMIT {
-            let _ = publisher.publish(job_id, "\n[CRITICAL] LOG QUOTA EXCEEDED. KILLING CONTAINER.\n").await;
-            error!("[{}] Log Hard Limit ({} MB) exceeded. Killing container...", job_id, LOG_HARD_LIMIT / 1024 / 1024);
-            
+            let _ = publisher
+                .publish(
+                    job_id,
+                    "\n[CRITICAL] LOG QUOTA EXCEEDED. KILLING CONTAINER.\n",
+                )
+                .await;
+            error!(
+                "[{}] Log Hard Limit ({} MB) exceeded. Killing container...",
+                job_id,
+                LOG_HARD_LIMIT / 1024 / 1024
+            );
+
             // Kill the container
             if let Err(e) = docker.kill_container::<String>(name, None).await {
-                 error!("[{}] Failed to kill container after log overflow: {}", job_id, e);
+                error!(
+                    "[{}] Failed to kill container after log overflow: {}",
+                    job_id, e
+                );
             }
-            break; 
+            break;
         }
 
         // Protection 2: Rotation / Truncation
@@ -989,16 +1066,19 @@ async fn stream_logs_to_file_and_broadcast(docker: &Docker, name: &str, job_id: 
                 error!("Failed to seek log file: {}", e);
             }
             current_file_size = 0;
-            let warning = format!("\n--- [LOG TRUNCATED DUE TO SIZE LIMIT > {}MB] ---\n", LOG_ROTATION_THRESHOLD / 1024 / 1024);
+            let warning = format!(
+                "\n--- [LOG TRUNCATED DUE TO SIZE LIMIT > {}MB] ---\n",
+                LOG_ROTATION_THRESHOLD / 1024 / 1024
+            );
             if let Err(e) = file.write_all(warning.as_bytes()).await {
-                 error!("Failed to write warning to log file: {}", e);
+                error!("Failed to write warning to log file: {}", e);
             }
             current_file_size += warning.len() as u64;
         }
 
         // Write to file
         if let Err(e) = file.write_all(&msg).await {
-             error!("Failed to write to log file: {}", e);
+            error!("Failed to write to log file: {}", e);
         }
 
         // Broadcast to real-time subscribers via Redis

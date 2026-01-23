@@ -1,14 +1,14 @@
 use crate::db::{self, DbPool};
-use crate::queue::{RedisQueue, JobQueue};
 use crate::models::JobRegistry;
-use bollard::Docker;
+use crate::queue::{JobQueue, RedisQueue};
 use aws_config::BehaviorVersion;
+use bollard::Docker;
+use bollard::container::ListContainersOptions;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use tracing::{error, info, warn};
 use tokio::sync::RwLock;
-use std::collections::HashMap;
-use bollard::container::ListContainersOptions;
+use tracing::{error, info, warn};
 
 pub struct Infrastructure {
     pub db_pool: DbPool,
@@ -31,7 +31,10 @@ pub async fn setup() -> Result<Infrastructure, Box<dyn std::error::Error>> {
                     error!("❌ Failed to connect to DB after 5 attempts. Exiting.");
                     return Err(e);
                 }
-                warn!("⚠️  DB Connection failed: {}. Retrying in 5s... ({}/5)", e, db_retry_attempts);
+                warn!(
+                    "⚠️  DB Connection failed: {}. Retrying in 5s... ({}/5)",
+                    e, db_retry_attempts
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
@@ -40,7 +43,7 @@ pub async fn setup() -> Result<Infrastructure, Box<dyn std::error::Error>> {
 
     // 2. Initialize Redis Queue
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    
+
     if redis_url.starts_with("rediss://") {
         info!("🔐 Initializing Redis with TLS encryption...");
     } else {
@@ -76,46 +79,56 @@ pub async fn setup() -> Result<Infrastructure, Box<dyn std::error::Error>> {
     // 3b. Initialize JobRegistry
     info!("🔄 Performing State Reconciliation...");
     let job_registry: JobRegistry = Arc::new(RwLock::new(HashMap::new()));
-    
+
     let mut filters = HashMap::new();
     filters.insert("label".to_string(), vec!["managed_by=zorp".to_string()]);
-    
+
     let options = ListContainersOptions {
         all: true,
         filters,
         ..Default::default()
     };
-    
+
     if let Ok(containers) = docker.list_containers(Some(options)).await {
         let mut reg = job_registry.write().await;
         for c in containers {
             // Only care about running containers to populate registry
             if c.state.as_deref() == Some("running") {
                 if let (Some(id), Some(labels)) = (c.id, c.labels) {
-                     if let Some(job_id) = labels.get("job_id") {
-                         // Verify with DB
-                         let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT status FROM jobs WHERE id = ");
-                         q_builder.push_bind(job_id);
+                    if let Some(job_id) = labels.get("job_id") {
+                        // Verify with DB
+                        let mut q_builder = sqlx::query_builder::QueryBuilder::new(
+                            "SELECT status FROM jobs WHERE id = ",
+                        );
+                        q_builder.push_bind(job_id);
 
-                         if let Ok(Some((status,))) = q_builder.build_query_as::< (String,) >()
-                            .fetch_optional(&db_pool).await 
-                         {
-                             if status == "RUNNING" {
-                                 info!("   - Re-attached job: {} (Container: {})", job_id, id);
-                                 reg.insert(job_id.clone(), id.clone());
-                                 // Note: We cannot re-attach log stream easily for recovered jobs 
-                                 // without implementing `docker attach` logic again, which is complex.
-                                 // For now, recovered jobs won't support live streaming, only file logging.
-                             } else {
-                                 warn!("   - Zombie container found (Job {} is {}). Will be reaped.", job_id, status);
-                             }
-                         }
-                     }
+                        if let Ok(Some((status,))) = q_builder
+                            .build_query_as::<(String,)>()
+                            .fetch_optional(&db_pool)
+                            .await
+                        {
+                            if status == "RUNNING" {
+                                info!("   - Re-attached job: {} (Container: {})", job_id, id);
+                                reg.insert(job_id.clone(), id.clone());
+                                // Note: We cannot re-attach log stream easily for recovered jobs
+                                // without implementing `docker attach` logic again, which is complex.
+                                // For now, recovered jobs won't support live streaming, only file logging.
+                            } else {
+                                warn!(
+                                    "   - Zombie container found (Job {} is {}). Will be reaped.",
+                                    job_id, status
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    info!("✅ State Reconciliation Complete. Active Jobs: {}", job_registry.read().await.len());
+    info!(
+        "✅ State Reconciliation Complete. Active Jobs: {}",
+        job_registry.read().await.len()
+    );
 
     // Mandatory S3 Configuration
     let s3_bucket = env::var("S3_BUCKET_NAME").map_err(|_| {
@@ -131,9 +144,9 @@ pub async fn setup() -> Result<Infrastructure, Box<dyn std::error::Error>> {
         s3_config_builder = s3_config_builder.endpoint_url(endpoint);
     }
     if let Ok(force_path) = env::var("S3_FORCE_PATH_STYLE") {
-            s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
+        s3_config_builder = s3_config_builder.force_path_style(force_path.parse().unwrap_or(false));
     }
-    
+
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config_builder.build());
 
     Ok(Infrastructure {

@@ -1,5 +1,5 @@
-use redis::AsyncCommands;
 use futures_util::StreamExt;
+use redis::AsyncCommands;
 
 #[derive(Clone)]
 pub struct RedisLogPublisher {
@@ -14,17 +14,19 @@ impl RedisLogPublisher {
     pub async fn publish(&self, job_id: &str, message: &str) -> Result<(), redis::RedisError> {
         let mut conn = self.client.get_multiplexed_async_connection().await?;
         let key = format!("job:{}:logs:stream", job_id);
-        
+
         // Use Redis Streams (XADD) with MAXLEN to prevent infinite growth
-        // MAXLEN ~ 10000 log lines or handled by TTL elsewhere. 
+        // MAXLEN ~ 10000 log lines or handled by TTL elsewhere.
         // Here we just limit to 10000 to be safe.
-        let _: String = conn.xadd_maxlen(
-            &key, 
-            redis::streams::StreamMaxlen::Approx(10000), 
-            "*", 
-            &[("data", message)]
-        ).await?;
-        
+        let _: String = conn
+            .xadd_maxlen(
+                &key,
+                redis::streams::StreamMaxlen::Approx(10000),
+                "*",
+                &[("data", message)],
+            )
+            .await?;
+
         // Set TTL on the stream key so it expires eventually (e.g., 24h)
         let _: () = conn.expire(&key, 86400).await?;
 
@@ -32,10 +34,13 @@ impl RedisLogPublisher {
     }
 
     pub async fn subscribe(
-        &self, 
-        job_id: &str, 
-        last_id: Option<String>
-    ) -> Result<impl futures_util::Stream<Item = Result<(String, String), redis::RedisError>>, redis::RedisError> {
+        &self,
+        job_id: &str,
+        last_id: Option<String>,
+    ) -> Result<
+        impl futures_util::Stream<Item = Result<(String, String), redis::RedisError>>,
+        redis::RedisError,
+    > {
         let mut conn = self.client.get_multiplexed_async_connection().await?;
         let key = format!("job:{}:logs:stream", job_id);
         let start_id = last_id.unwrap_or_else(|| "0-0".to_string());
@@ -49,8 +54,8 @@ impl RedisLogPublisher {
                     .count(10);
 
                 let result: Option<redis::streams::StreamReadReply> = conn.xread_options(
-                    &[&key], 
-                    &[&current_id], 
+                    &[&key],
+                    &[&current_id],
                     &opts
                 ).await?;
 
@@ -71,7 +76,7 @@ impl RedisLogPublisher {
                         }
                     }
                 }
-                
+
                 if !had_data {
                     // Sleep to prevent tight loop if no data
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

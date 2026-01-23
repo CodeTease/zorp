@@ -1,25 +1,31 @@
+use crate::db::DbPool;
+use crate::models::JobContext;
+use crate::models::JobRegistry;
+use crate::queue::JobQueue;
+use crate::queue::RedisQueue;
 use bollard::Docker;
 use bollard::container::{ListContainersOptions, RemoveContainerOptions};
 use bollard::image::PruneImagesOptions;
-use bollard::volume::PruneVolumesOptions;
-use crate::models::JobRegistry;
-use crate::db::DbPool;
-use tracing::{info, warn, error};
-use std::time::SystemTime;
-use futures_util::StreamExt;
 use bollard::system::EventsOptions;
-use crate::queue::RedisQueue;
-use std::sync::Arc;
+use bollard::volume::PruneVolumesOptions;
+use futures_util::StreamExt;
 use redis::AsyncCommands;
+use std::sync::Arc;
+use std::time::SystemTime;
+use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::models::JobContext;
-use crate::queue::JobQueue;
 
-pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, queue: Arc<RedisQueue>, s3_client: aws_sdk_s3::Client, s3_bucket: String) -> tokio::task::JoinHandle<()> {
-
+pub fn spawn(
+    docker: Docker,
+    db: DbPool,
+    registry: JobRegistry,
+    queue: Arc<RedisQueue>,
+    s3_client: aws_sdk_s3::Client,
+    s3_bucket: String,
+) -> tokio::task::JoinHandle<()> {
     let docker_events = docker.clone();
     let db_events = db.clone();
-    
+
     tokio::spawn(async move {
         info!("👂 Docker Event Listener started.");
         let mut filters = std::collections::HashMap::new();
@@ -40,21 +46,33 @@ pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, queue: Arc<Redis
                     if let Some(actor) = event.actor {
                         if let Some(attributes) = actor.attributes {
                             if let Some(job_id) = attributes.get("job_id") {
-                                info!("⚡ Event Listener: Detected death of job container {}", job_id);
-                                
-                                let mut q_select = sqlx::query_builder::QueryBuilder::new("SELECT status FROM jobs WHERE id = ");
+                                info!(
+                                    "⚡ Event Listener: Detected death of job container {}",
+                                    job_id
+                                );
+
+                                let mut q_select = sqlx::query_builder::QueryBuilder::new(
+                                    "SELECT status FROM jobs WHERE id = ",
+                                );
                                 q_select.push_bind(job_id);
-                                
-                                let row = q_select.build_query_as::< (String,) >()
-                                    .fetch_optional(&db_events).await;
+
+                                let row = q_select
+                                    .build_query_as::<(String,)>()
+                                    .fetch_optional(&db_events)
+                                    .await;
 
                                 if let Ok(Some((status,))) = row {
                                     if status == "RUNNING" {
-                                        warn!("⚡ Event Listener: Job {} died unexpectedly. Updating DB...", job_id);
-                                        
-                                        let mut q_update = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET status = 'FAILED', exit_code = -999 WHERE id = ");
+                                        warn!(
+                                            "⚡ Event Listener: Job {} died unexpectedly. Updating DB...",
+                                            job_id
+                                        );
+
+                                        let mut q_update = sqlx::query_builder::QueryBuilder::new(
+                                            "UPDATE jobs SET status = 'FAILED', exit_code = -999 WHERE id = ",
+                                        );
                                         q_update.push_bind(job_id);
-                                        
+
                                         let _ = q_update.build().execute(&db_events).await;
                                     }
                                 }
@@ -73,8 +91,10 @@ pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, queue: Arc<Redis
     // 2. Fallback Poller (Every 60s) WITH LEADER ELECTION
     tokio::spawn(async move {
         info!("逐 Zombie Reaper & Garbage Collector task started.");
-        
-        let client = match redis::Client::open(std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())) {
+
+        let client = match redis::Client::open(
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to connect to Redis for Leader Election: {}", e);
@@ -110,10 +130,10 @@ pub fn spawn(docker: Docker, db: DbPool, registry: JobRegistry, queue: Arc<Redis
             match result {
                 Ok(val) if val == "OK" => {
                     info!("👑 Acquired Leader Lock. Running maintenance tasks...");
-                    
+
                     // Reap Zombies (every 60s)
                     reap_zombies(&docker, &db).await;
-                    
+
                     // Garbage Collection (Temp files & Pruning)
                     garbage_collection(&docker, &registry).await;
 
@@ -141,9 +161,9 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
     // We scan for jobs that have been 'QUEUED' for > 5 minutes and are not running.
 
     let query = if cfg!(feature = "postgres") {
-        "SELECT id, image, commands, callback_url, user_id, enable_network FROM jobs WHERE status = 'QUEUED' AND created_at < NOW() - INTERVAL '5 minutes'"
+        "SELECT id, image, commands, callback_url, user_id, enable_network FROM jobs WHERE status IN ('QUEUED', 'PENDING') AND created_at < NOW() - INTERVAL '5 minutes'"
     } else {
-        "SELECT id, image, commands, callback_url, user_id, enable_network FROM jobs WHERE status = 'QUEUED' AND created_at < date('now', '-5 minutes')"
+        "SELECT id, image, commands, callback_url, user_id, enable_network FROM jobs WHERE status IN ('QUEUED', 'PENDING') AND created_at < date('now', '-5 minutes')"
     };
 
     // Using a struct that matches the query columns for sqlx::FromRow
@@ -161,25 +181,31 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
 
     match rows {
         Ok(jobs) => {
-            if jobs.is_empty() { return; }
-            warn!("⚠️  Reaper found {} stuck/orphan jobs (QUEUED > 5m). Attempting to re-enqueue...", jobs.len());
+            if jobs.is_empty() {
+                return;
+            }
+            warn!(
+                "⚠️  Reaper found {} stuck/orphan jobs (QUEUED > 5m). Attempting to re-enqueue...",
+                jobs.len()
+            );
 
             for job in jobs {
-                let commands_vec: Vec<String> = serde_json::from_str(&job.commands).unwrap_or_default();
-                
+                let commands_vec: Vec<String> =
+                    serde_json::from_str(&job.commands).unwrap_or_default();
+
                 let context = JobContext {
                     id: job.id.clone(),
                     image: job.image,
                     commands: commands_vec,
-                    env: None, // Lost if not in DB
+                    env: None,    // Lost if not in DB
                     limits: None, // Lost if not in DB
                     callback_url: job.callback_url,
                     timeout_seconds: None, // Lost
-                    artifacts_path: None, // Lost
+                    artifacts_path: None,  // Lost
                     user: job.user_id,
-                    cache_key: None, // Lost
-                    cache_paths: None, // Lost
-                    services: vec![], // Lost
+                    cache_key: None,    // Lost
+                    cache_paths: None,  // Lost
+                    services: vec![],   // Lost
                     on_success: vec![], // Lost
                     debug: false,
                     priority: None,
@@ -188,6 +214,7 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
                     run_at: None,
                     stream_id: None,
                     stream_name: None,
+                    trace_context: std::collections::HashMap::new(),
                 };
 
                 info!("♻️  Re-enqueuing stuck job: {}", context.id);
@@ -195,53 +222,57 @@ async fn requeue_stuck_jobs(db: &DbPool, queue: &Arc<RedisQueue>) {
                     error!("Failed to re-enqueue job {}: {}", job.id, e);
                 }
             }
-        },
+        }
         Err(e) => {
-             error!("Failed to query stuck jobs: {}", e);
+            error!("Failed to query stuck jobs: {}", e);
         }
     }
 }
 
 async fn cleanup_old_jobs(db: &DbPool, s3: &aws_sdk_s3::Client, bucket: &str) {
     info!("🧹 Running Artifact Retention Policy Cleanup...");
-    
+
     let query = if cfg!(feature = "postgres") {
         "SELECT id, logs, artifact_url FROM jobs WHERE created_at < NOW() - INTERVAL '30 days'"
     } else {
         "SELECT id, logs, artifact_url FROM jobs WHERE created_at < date('now', '-30 days')"
     };
 
-    let rows: Result<Vec<(String, Option<String>, Option<String>)>, _> = sqlx::query_as(query)
-        .fetch_all(db).await;
+    let rows: Result<Vec<(String, Option<String>, Option<String>)>, _> =
+        sqlx::query_as(query).fetch_all(db).await;
 
     match rows {
         Ok(jobs) => {
-            if jobs.is_empty() { return; }
+            if jobs.is_empty() {
+                return;
+            }
             info!("Found {} old jobs to clean up.", jobs.len());
 
             for (id, logs, artifact_url) in jobs {
                 if let Some(url) = artifact_url {
                     if let Some(key) = extract_s3_key(&url) {
-                         info!("Deleting old artifact: {}", key);
-                         let _ = s3.delete_object().bucket(bucket).key(&key).send().await;
+                        info!("Deleting old artifact: {}", key);
+                        let _ = s3.delete_object().bucket(bucket).key(&key).send().await;
                     }
                 }
-                
+
                 if let Some(log_data) = logs {
                     if log_data.starts_with("s3://") {
-                         if let Some(key) = extract_s3_key(&log_data) {
-                             info!("Deleting old log: {}", key);
-                             let _ = s3.delete_object().bucket(bucket).key(&key).send().await;
-                         }
+                        if let Some(key) = extract_s3_key(&log_data) {
+                            info!("Deleting old log: {}", key);
+                            let _ = s3.delete_object().bucket(bucket).key(&key).send().await;
+                        }
                     }
                 }
 
                 // Use QueryBuilder for DB compatibility ($1 vs ?)
-                let mut q = sqlx::query_builder::QueryBuilder::new("UPDATE jobs SET logs = NULL, artifact_url = NULL WHERE id = ");
+                let mut q = sqlx::query_builder::QueryBuilder::new(
+                    "UPDATE jobs SET logs = NULL, artifact_url = NULL WHERE id = ",
+                );
                 q.push_bind(&id);
                 let _ = q.build().execute(db).await;
             }
-        },
+        }
         Err(e) => {
             error!("Failed to query old jobs: {}", e);
         }
@@ -271,43 +302,83 @@ async fn reap_zombies(docker: &Docker, db: &DbPool) {
 
     if let Ok(containers) = docker.list_containers(Some(options)).await {
         for c in containers {
-            let job_id = c.labels.as_ref()
-                .and_then(|l| l.get("job_id"))
-                .cloned();
+            let job_id = c.labels.as_ref().and_then(|l| l.get("job_id")).cloned();
 
             // Check if it's a DEBUG container
-            let is_debug = c.labels.as_ref()
+            let is_debug = c
+                .labels
+                .as_ref()
                 .and_then(|l| l.get("zorp_debug"))
                 .map(|v| v == "true")
                 .unwrap_or(false);
 
             if let Some(jid) = job_id {
-                 let mut q_builder = sqlx::query_builder::QueryBuilder::new("SELECT status FROM jobs WHERE id = ");
-                 q_builder.push_bind(&jid);
-                 
-                 let row = q_builder.build_query_as::< (String,) >()
-                     .fetch_optional(db).await;
+                let mut q_builder =
+                    sqlx::query_builder::QueryBuilder::new("SELECT status FROM jobs WHERE id = ");
+                q_builder.push_bind(&jid);
 
-                 let should_kill = match row {
-                     Ok(Some((status,))) => status != "RUNNING" && status != "QUEUED",
-                     Ok(None) => true, // Job not in DB? Zombie.
-                     Err(_) => false,
-                 };
+                let row = q_builder
+                    .build_query_as::<(String,)>()
+                    .fetch_optional(db)
+                    .await;
 
-                 if should_kill {
-                     if c.state.as_deref() == Some("running") {
-                         warn!("逐 Reaper: Found active zombie {} (Job {}). Terminating...", c.id.as_deref().unwrap_or("?"), jid);
-                         if let Some(id) = c.id.as_ref() {
+                let created = c.created.unwrap_or(0);
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let age_seconds = now - created;
+
+                let should_kill = match row {
+                    Ok(Some((status,))) => {
+                        if status == "RUNNING" {
+                            false
+                        } else if status == "QUEUED" || status == "PENDING" {
+                            // Check age to avoid killing jobs just starting (race condition)
+                            if age_seconds > 30 {
+                                warn!(
+                                    "逐 Reaper: State Mismatch! Container {} exists but DB says {}. Age: {}s. Killing zombie...",
+                                    jid, status, age_seconds
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            // FAILED, FINISHED, CANCELLED
+                            true
+                        }
+                    }
+                    Ok(None) => true, // Job not in DB? Zombie.
+                    Err(_) => false,
+                };
+
+                if should_kill {
+                    if c.state.as_deref() == Some("running") {
+                        warn!(
+                            "逐 Reaper: Found active zombie {} (Job {}). Terminating...",
+                            c.id.as_deref().unwrap_or("?"),
+                            jid
+                        );
+                        if let Some(id) = c.id.as_ref() {
                             let _ = docker.kill_container::<String>(id, None).await;
-                         }
-                     }
-                     
-                     if !is_debug {
-                         if let Some(id) = c.id.as_ref() {
-                            let _ = docker.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
-                         }
-                     }
-                 }
+                        }
+                    }
+
+                    if !is_debug {
+                        if let Some(id) = c.id.as_ref() {
+                            let _ = docker
+                                .remove_container(
+                                    id,
+                                    Some(RemoveContainerOptions {
+                                        force: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -323,13 +394,14 @@ async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.starts_with("zorp-") {
                     let job_id = if name.starts_with("zorp-artifacts-") {
-                        name.trim_start_matches("zorp-artifacts-").trim_end_matches(".tar")
+                        name.trim_start_matches("zorp-artifacts-")
+                            .trim_end_matches(".tar")
                     } else {
                         name.trim_start_matches("zorp-").trim_end_matches(".log")
                     };
 
                     if registry.read().await.contains_key(job_id) {
-                         continue;
+                        continue;
                     }
 
                     if let Ok(metadata) = entry.metadata().await {
@@ -350,7 +422,7 @@ async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
     // 2. Clean up Debug Containers (> 30 mins)
     let mut filters = std::collections::HashMap::new();
     filters.insert("label".to_string(), vec!["zorp_debug=true".to_string()]);
-    
+
     let options = ListContainersOptions {
         all: true,
         filters: filters.clone(),
@@ -359,21 +431,38 @@ async fn garbage_collection(docker: &Docker, registry: &JobRegistry) {
 
     if let Ok(containers) = docker.list_containers(Some(options)).await {
         for c in containers {
-             if let Some(created) = c.created {
-                 let created_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(created as u64);
-                 if let Ok(age) = SystemTime::now().duration_since(created_time) {
-                     if age > std::time::Duration::from_secs(1800) { 
-                         if let Some(id) = c.id {
-                             info!("🧹 GC: Removing expired debug container {}", id);
-                             let _ = docker.remove_container(&id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
-                         }
-                     }
-                 }
-             }
+            if let Some(created) = c.created {
+                let created_time =
+                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(created as u64);
+                if let Ok(age) = SystemTime::now().duration_since(created_time) {
+                    if age > std::time::Duration::from_secs(1800) {
+                        if let Some(id) = c.id {
+                            info!("🧹 GC: Removing expired debug container {}", id);
+                            let _ = docker
+                                .remove_container(
+                                    &id,
+                                    Some(RemoveContainerOptions {
+                                        force: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
         }
     }
 
     // 3. Prune Docker Resources
-    let _ = docker.prune_images(Some(PruneImagesOptions::<String> { filters: std::collections::HashMap::new() })).await; 
-    let _ = docker.prune_volumes(Some(PruneVolumesOptions::<String> { filters: std::collections::HashMap::new() })).await;
+    let _ = docker
+        .prune_images(Some(PruneImagesOptions::<String> {
+            filters: std::collections::HashMap::new(),
+        }))
+        .await;
+    let _ = docker
+        .prune_volumes(Some(PruneVolumesOptions::<String> {
+            filters: std::collections::HashMap::new(),
+        }))
+        .await;
 }

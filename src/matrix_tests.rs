@@ -1,15 +1,17 @@
-
 #[cfg(test)]
 mod tests {
-    use crate::models::JobRequest;
     use crate::matrix;
+    use crate::models::JobRequest;
     use std::collections::HashMap;
 
     #[test]
     fn test_matrix_expansion_and_substitution() {
         let mut matrix = HashMap::new();
         matrix.insert("node".to_string(), vec!["18".to_string(), "20".to_string()]);
-        matrix.insert("os".to_string(), vec!["alpine".to_string(), "ubuntu".to_string()]);
+        matrix.insert(
+            "os".to_string(),
+            vec!["alpine".to_string(), "ubuntu".to_string()],
+        );
 
         let req = JobRequest {
             image: "node:${node}-${os}".to_string(),
@@ -37,20 +39,19 @@ mod tests {
         assert_eq!(expanded.len(), 4);
 
         // Check for specific combinations
-        let has_node18_alpine = expanded.iter().any(|j| 
-            j.image == "node:18-alpine" && 
-            j.commands[0] == "echo running on alpine with node 18" &&
-            j.env.as_ref().unwrap().get("node").unwrap() == "18" &&
-            j.env.as_ref().unwrap().get("os").unwrap() == "alpine"
-        );
+        let has_node18_alpine = expanded.iter().any(|j| {
+            j.image == "node:18-alpine"
+                && j.commands[0] == "echo running on alpine with node 18"
+                && j.env.as_ref().unwrap().get("node").unwrap() == "18"
+                && j.env.as_ref().unwrap().get("os").unwrap() == "alpine"
+        });
         assert!(has_node18_alpine, "Missing node 18 alpine combination");
 
-        let has_node20_ubuntu = expanded.iter().any(|j| 
-            j.image == "node:20-ubuntu" && 
-            j.commands[0] == "echo running on ubuntu with node 20"
-        );
+        let has_node20_ubuntu = expanded.iter().any(|j| {
+            j.image == "node:20-ubuntu" && j.commands[0] == "echo running on ubuntu with node 20"
+        });
         assert!(has_node20_ubuntu, "Missing node 20 ubuntu combination");
-        
+
         // Ensure matrix field is cleared to prevent re-expansion
         for job in expanded {
             assert!(job.matrix.is_none());
