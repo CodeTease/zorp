@@ -28,7 +28,7 @@ aws-smithy-http = { version = "0.62" }
 tokio-stream = { version = "0.1" }
 
 # Docker Interface
-bollard = "0.20"
+bollard = "0.15"
 
 # Queue System (Redis)
 redis = { version = "1.0", features = ["tokio-comp", "tokio-rustls-comp"] }
