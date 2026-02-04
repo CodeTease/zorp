@@ -17,11 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # MAGIC IS HERE: Smart caching for Rust
       - name: ⚡ Cache Cargo Registry & Target
         uses: Swatinem/rust-cache@v2
         with:
-          # Key giúp phân biệt cache giữa các job khác nhau
           key: "sqlite-build"
 
       - name: Check Compile (SQLite)
@@ -52,7 +50,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # MAGIC IS HERE: Reuse dependencies compiled in previous runs
       - name: ⚡ Cache Cargo Registry & Target
         uses: Swatinem/rust-cache@v2
         with:

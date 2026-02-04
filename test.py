@@ -26,7 +26,7 @@ HOST_IP = "127.0.0.1"
 WEBHOOK_URL = f"http://{HOST_IP}:{WEBHOOK_PORT}"
 
 # Tăng áp lực lên một chút
-NUM_CONCURRENT_JOBS = 60
+NUM_CONCURRENT_JOBS = 50
 # Giới hạn thời gian chờ tối đa cho toàn bộ test
 MAX_WAIT_TIME = 30 
 
@@ -75,7 +75,7 @@ def generate_scenario(index):
         {
             "type": "HEAVY", # Test limits params
             "image": "busybox:latest",
-            "commands": ["sh", "-c", f"echo 'Checking limits...' && sleep 2"],
+            "commands": ["sh", "-c", "echo 'Checking limits...' && sleep 2"],
             "limits": {"memory_mb": 128, "cpu_cores": 0.5},
             "expect_status": "FINISHED",
             "expect_exit": 0,
@@ -184,7 +184,7 @@ def dispatch_worker(i):
         print(f"🔥 [{i:02d}] Connection Error: {e}")
 
 def main():
-    print(f"\n⚡ ZORP CHAOS TESTER ⚡")
+    print("\n⚡ ZORP CHAOS TESTER ⚡")
     print(f"Target: {ZORP_URL} | Jobs: {NUM_CONCURRENT_JOBS}")
     print("-" * 50)
 

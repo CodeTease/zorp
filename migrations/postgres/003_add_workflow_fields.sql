@@ -1,0 +1,2 @@
+ALTER TABLE jobs ADD COLUMN services TEXT;
+ALTER TABLE jobs ADD COLUMN on_success TEXT;

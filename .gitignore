@@ -24,3 +24,9 @@ target
 zorp.*
 .env
 venv
+
+# Vegh
+*.vegh 
+.veghcache/
+# Rarely use this but ignore it just in case
+.veghhooks.json
